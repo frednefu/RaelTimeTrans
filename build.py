@@ -9,6 +9,9 @@ APP_NAME = "RealTimeTranslation"
 APP_VERSION = "1.0.0"
 MAIN_SCRIPT = "main.py"
 
+# 获取Python库路径
+PYTHON_LIB_PATH = os.path.dirname(sys.executable)
+
 # 打包前清理
 def clean_build():
     """清理之前的构建文件"""
@@ -44,6 +47,8 @@ def build_app():
         "--icon=icon.ico" if os.path.exists("icon.ico") else "",
         "--windowed",  # 不显示控制台窗口
         "--noconfirm",  # 覆盖现有文件
+        "--paths", PYTHON_LIB_PATH,  # 添加Python库路径
+        "--add-binary", f"{PYTHON_LIB_PATH}\\python38.dll;.",  # 显式包含Python DLL
         "--add-data", "LICENSE;.",
         "--add-data", "README.md;.",
         # 添加必要的目录
