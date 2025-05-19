@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 > nul
-setlocal EnableDelayedExpansion
+setlocal
 
 echo ========================================
 echo Real-time Translation App Packager (Conda)
@@ -14,34 +14,46 @@ if %ERRORLEVEL% NEQ 0 (
     goto :error
 )
 
+:: 初始化环境变量
+set "env_line="
+set "env_name=realtimetrans"
+
 :: 查询当前激活的环境
 echo Checking for active Conda environment...
-set env_line=
 for /f "tokens=*" %%a in ('conda info --envs ^| findstr "*"') do (
-    set env_line=%%a
+    set "env_line=%%a"
 )
 
 if not defined env_line (
     echo [WARNING] No active Conda environment detected.
     
     :: 列出可用的环境
+    echo.
     echo Available environments:
     conda env list
+    echo.
     
     :: 提示用户输入环境名称
-    set /p env_name=Enter environment name to activate (or press Enter to create a new one): 
+    set /p env_name=Enter environment name to activate (or press Enter to use default): 
     
-    if "!env_name!"=="" (
-        echo Creating a new environment...
-        set env_name=realtimetrans
-        conda create -y -n !env_name! python=3.8
+    if "!env_name!"=="" set "env_name=realtimetrans"
+    
+    :: 检查环境是否存在
+    conda env list | findstr "\<%env_name%\>" >nul
+    if %ERRORLEVEL% NEQ 0 (
+        echo Creating new environment: %env_name%...
+        conda create -y -n %env_name% python=3.8
+        if %ERRORLEVEL% NEQ 0 (
+            echo [ERROR] Failed to create Conda environment.
+            goto :error
+        )
     )
     
     :: 激活环境
-    echo Activating environment !env_name!...
-    call conda activate !env_name!
+    echo Activating environment: %env_name%...
+    call conda activate %env_name%
 ) else (
-    echo Active environment detected: !env_line!
+    echo Active environment detected: %env_line%
 )
 
 :: 检查PyInstaller
@@ -83,12 +95,20 @@ if exist RealTimeTranslation.spec del RealTimeTranslation.spec
 :: 确保Subtitles目录存在
 if not exist Subtitles mkdir Subtitles
 
+:: 找出Python路径
+for /f "tokens=*" %%i in ('where python') do (
+    set "python_path=%%~dpi"
+    goto :found_python
+)
+:found_python
+
 :: 运行打包脚本 (使用OneFile模式)
-python -c "import sys; print('Using Python from:', sys.executable)"
+echo Using Python from: %python_path%
 pyinstaller --onefile --name RealTimeTranslation --windowed --noconfirm ^
   --add-data "LICENSE;." ^
   --add-data "README.md;." ^
   --add-data "Subtitles;Subtitles" ^
+  --add-binary "%python_path%python38.dll;." ^
   --hidden-import=whisper ^
   --hidden-import=whisper.tokenizer ^
   --hidden-import=torch ^
