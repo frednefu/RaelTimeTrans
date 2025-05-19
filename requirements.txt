@@ -1,0 +1,9 @@
+torch==2.0.1
+torchaudio==2.0.2
+openai-whisper==20231117
+python-dotenv==1.0.0
+pydub==0.25.1
+pyaudio==0.2.13
+sounddevice==0.4.6
+PySide6==6.5.0
+googletrans==4.0.0-rc1 
