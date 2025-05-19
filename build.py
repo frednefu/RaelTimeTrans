@@ -53,7 +53,7 @@ def build_app():
         "--hidden-import=whisper.tokenizer",
         "--hidden-import=torch",
         "--hidden-import=numpy",
-        "--hidden-import=PyQt6",
+        # 只保留PySide6，移除PyQt6
         "--hidden-import=PySide6",
         "--hidden-import=googletrans",
         # 入口脚本
