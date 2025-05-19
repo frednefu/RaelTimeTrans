@@ -16,6 +16,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 :: 查询当前激活的环境
 echo Checking for active Conda environment...
+set env_line=
 for /f "tokens=*" %%a in ('conda info --envs ^| findstr "*"') do (
     set env_line=%%a
 )
@@ -58,6 +59,16 @@ if %ERRORLEVEL% NEQ 0 (
 
 :: 检查项目依赖
 echo Checking project dependencies...
+python -c "import PyInstaller.utils.hooks" >nul 2>&1
+if %ERRORLEVEL% NEQ 0 (
+    echo [WARNING] PyInstaller hooks module not found. Reinstalling PyInstaller...
+    pip install --upgrade pyinstaller
+    if %ERRORLEVEL% NEQ 0 (
+        echo [ERROR] Failed to install PyInstaller hooks.
+        goto :error
+    )
+)
+
 python -c "import whisper, torch, PySide6, googletrans" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo [WARNING] Some project dependencies are missing. Installing from requirements.txt...

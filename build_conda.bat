@@ -16,6 +16,7 @@ if %ERRORLEVEL% NEQ 0 (
 
 :: 查询当前激活的环境
 echo Checking for active Conda environment...
+set env_line=
 for /f "tokens=*" %%a in ('conda info --envs ^| findstr "*"') do (
     set env_line=%%a
 )
@@ -70,11 +71,32 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo Starting packaging process...
+echo Starting packaging process (OneFile mode)...
 echo.
 
-:: 运行打包脚本
-python build.py
+:: 清理之前的构建
+echo Cleaning previous builds...
+if exist build rmdir /s /q build
+if exist dist rmdir /s /q dist
+if exist RealTimeTranslation.spec del RealTimeTranslation.spec
+
+:: 确保Subtitles目录存在
+if not exist Subtitles mkdir Subtitles
+
+:: 运行打包脚本 (使用OneFile模式)
+python -c "import sys; print('Using Python from:', sys.executable)"
+pyinstaller --onefile --name RealTimeTranslation --windowed --noconfirm ^
+  --add-data "LICENSE;." ^
+  --add-data "README.md;." ^
+  --add-data "Subtitles;Subtitles" ^
+  --hidden-import=whisper ^
+  --hidden-import=whisper.tokenizer ^
+  --hidden-import=torch ^
+  --hidden-import=numpy ^
+  --hidden-import=PySide6 ^
+  --hidden-import=googletrans ^
+  main.py
+
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] An error occurred during the packaging process.
     goto :error
@@ -83,7 +105,7 @@ if %ERRORLEVEL% NEQ 0 (
 echo.
 echo Packaging process completed!
 echo.
-echo You can find the executable in the dist\RealTimeTranslation\ directory.
+echo You can find the executable at: dist\RealTimeTranslation.exe
 echo.
 goto :end
 
