@@ -1,56 +1,57 @@
 @echo off
+chcp 65001 > nul
 setlocal EnableDelayedExpansion
 
 echo ========================================
-echo 实时翻译应用程序打包工具
+echo Real-time Translation App Packager
 echo ========================================
 echo.
 
 :: 检查Python环境
-echo 检查Python环境...
+echo Checking Python environment...
 python --version > nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [错误] 未检测到Python。请确保已安装Python并添加到系统PATH中。
+    echo [ERROR] Python not detected. Please ensure Python is installed and added to your PATH.
     goto :error
 )
 
 :: 检查是否安装了PyInstaller
-echo 检查PyInstaller...
+echo Checking PyInstaller...
 python -c "import PyInstaller" > nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo [警告] 未检测到PyInstaller。尝试安装...
+    echo [WARNING] PyInstaller not detected. Attempting to install...
     pip install pyinstaller
     if %ERRORLEVEL% NEQ 0 (
-        echo [错误] 安装PyInstaller失败。
+        echo [ERROR] Failed to install PyInstaller.
         goto :error
     )
-    echo PyInstaller安装成功。
+    echo PyInstaller installed successfully.
 )
 
 echo.
-echo 开始打包应用程序...
+echo Starting packaging process...
 echo.
 
 :: 执行打包脚本
 python build.py
 if %ERRORLEVEL% NEQ 0 (
-    echo [错误] 打包过程中发生错误。
+    echo [ERROR] An error occurred during the packaging process.
     goto :error
 )
 
 echo.
-echo 打包过程完成！
+echo Packaging process completed!
 echo.
-echo 您可以在 dist\实时翻译\ 目录中找到可执行文件。
+echo You can find the executable in the dist\RealTimeTranslation\ directory.
 echo.
 goto :end
 
 :error
 echo.
-echo 打包过程失败。请检查上述错误信息。
+echo Packaging process failed. Please check the error messages above.
 exit /b 1
 
 :end
-echo 按任意键退出...
+echo Press any key to exit...
 pause > nul
 exit /b 0 
