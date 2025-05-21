@@ -1,0 +1,18 @@
+{
+    "whisper_model": "tiny",
+    "font_size": 19,
+    "font_color": "#ffff7f",
+    "position": "bottom",
+    "use_gpu": true,
+    "device": "cuda",
+    "source_language": "auto",
+    "target_language": "zh",
+    "window_width": 1000,
+    "window_height": 58,
+    "subtitle_mode": "both",
+    "input_device": "CABLE Output (VB-Audio Virtual  (Index: 1)",
+    "output_device": "扬声器 (Realtek High Definition Au (Index: 5)",
+    "monitor_enabled": true,
+    "main_window_width": 800,
+    "main_window_height": 771
+}

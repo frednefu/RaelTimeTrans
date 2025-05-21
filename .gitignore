@@ -38,3 +38,9 @@ Thumbs.db
 # Project specific
 *.log
 whisper-models/ 
+Subtitles/*.srt
+settings.json
+settings_backup.json
+*.tmp
+direct_error.log
+ffmpeg_temp/ 

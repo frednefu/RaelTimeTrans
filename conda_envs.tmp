@@ -1,0 +1,11 @@
+# conda environments:
+#
+base                     C:\ProgramData\miniconda3
+cse38                    C:\Users\Administrator\.conda\envs\cse38
+face                     C:\Users\Administrator\.conda\envs\face
+fred                     C:\Users\Administrator\.conda\envs\fred
+modelscope               C:\Users\Administrator\.conda\envs\modelscope
+pdf2word                 C:\Users\Administrator\.conda\envs\pdf2word
+realtimetrans            C:\Users\Administrator\.conda\envs\realtimetrans
+whisperx                 C:\Users\Administrator\.conda\envs\whisperx
+

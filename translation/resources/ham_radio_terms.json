@@ -1,0 +1,343 @@
+{
+    "CQ": {
+        "zh-cn": "CQ",
+        "en": "CQ",
+        "ja": "CQ",
+        "ko": "CQ",
+        "description": "用于呼叫任何电台"
+    },
+    "QRZ": {
+        "zh-cn": "QRZ（谁在呼叫我）",
+        "en": "QRZ (Who is calling me?)",
+        "ja": "QRZ（誰が私を呼んでいますか）",
+        "ko": "QRZ (누가 저를 호출하고 있습니까)",
+        "description": "询问谁在呼叫"
+    },
+    "73": {
+        "zh-cn": "73（最好的祝福）",
+        "en": "73 (Best regards)",
+        "ja": "73（よろしくお願いします）",
+        "ko": "73 (최고의 안부)",
+        "description": "表示最好的祝福，通常用于通信结束时"
+    },
+    "ROGER": {
+        "zh-cn": "收到，明白",
+        "en": "Roger",
+        "ja": "了解しました",
+        "ko": "수신, 이해함",
+        "description": "表示已经收到并理解信息"
+    },
+    "COPY": {
+        "zh-cn": "抄收",
+        "en": "Copy",
+        "ja": "コピー",
+        "ko": "카피",
+        "description": "表示已经抄收信息"
+    },
+    "CALLING": {
+        "zh-cn": "呼叫",
+        "en": "Calling",
+        "ja": "呼叫",
+        "ko": "호출",
+        "description": "表示呼叫"
+    },
+    "QTH": {
+        "zh-cn": "QTH（位置）",
+        "en": "QTH (Location)",
+        "ja": "QTH（位置）",
+        "ko": "QTH (위치)",
+        "description": "表示操作员的位置"
+    },
+    "QSO": {
+        "zh-cn": "QSO（通联）",
+        "en": "QSO (Contact)",
+        "ja": "QSO（交信）",
+        "ko": "QSO (교신)",
+        "description": "表示无线电联系"
+    },
+    "QSL": {
+        "zh-cn": "QSL（确认收到）",
+        "en": "QSL (I confirm receipt)",
+        "ja": "QSL（受信確認）",
+        "ko": "QSL (수신 확인)",
+        "description": "表示确认收到"
+    },
+    "QRM": {
+        "zh-cn": "QRM（干扰）",
+        "en": "QRM (Interference)",
+        "ja": "QRM（人工的な干渉）",
+        "ko": "QRM (인위적 간섭)",
+        "description": "表示人为干扰"
+    },
+    "QRN": {
+        "zh-cn": "QRN（自然干扰）",
+        "en": "QRN (Natural interference)",
+        "ja": "QRN（自然干渉）",
+        "ko": "QRN (자연 간섭)",
+        "description": "表示自然（静电）干扰"
+    },
+    "QRP": {
+        "zh-cn": "QRP（低功率）",
+        "en": "QRP (Low power)",
+        "ja": "QRP（低電力運用）",
+        "ko": "QRP (저전력 운용)",
+        "description": "表示低功率操作"
+    },
+    "QST": {
+        "zh-cn": "QST（致所有电台的通告）",
+        "en": "QST (announcement to all stations)",
+        "description": "发送给所有电台的通知"
+    },
+    "PHONETIC_CALLSIGN": {
+        "zh-cn": "字母解释法呼号，直接译为呼号本身",
+        "en": "Phonetic callsign, translate directly to the callsign itself",
+        "ja": "フォネティックコールサイン、そのままコールサインに訳す",
+        "ko": "음성 알파벳 호출부호, 호출부호 자체로 번역",
+        "description": "如 Alpha Bravo Charlie... 这种字母解释法呼号，遇到时直接还原为呼号本身，不做翻译。"
+    },
+    "OVER": {
+        "zh-cn": "完毕",
+        "en": "Over",
+        "ja": "完了しました",
+        "ko": "완료됨",
+        "description": "表示通信结束"
+    },
+    "OUT": {
+        "zh-cn": "结束通话",
+        "en": "Out",
+        "ja": "終了しました",
+        "ko": "통화 종료됨",
+        "description": "表示通话结束"
+    },
+    "88": {
+        "zh-cn": "88（爱与吻）",
+        "en": "88 (Love and kisses)",
+        "ja": "88（愛とキス）",
+        "ko": "88 (사랑과 키스)",
+        "description": "表示爱与吻，通常用于通信结束时"
+    },
+    "QSB": {
+        "zh-cn": "QSB（信号衰落）",
+        "en": "QSB (Signal fading)",
+        "ja": "QSB（信号の減衰）",
+        "ko": "QSB (신호 감쇠)",
+        "description": "表示信号衰落"
+    },
+    "QSY": {
+        "zh-cn": "QSY（改变频率）",
+        "en": "QSY (Change frequency)",
+        "ja": "QSY（周波数の変更）",
+        "ko": "QSY (주파수 변경)",
+        "description": "表示频率改变"
+    },
+    "QRT": {
+        "zh-cn": "QRT（停止发射）",
+        "en": "QRT (Stop transmitting)",
+        "ja": "QRT（送信を停止）",
+        "ko": "QRT (전송 중지)",
+        "description": "表示停止发射"
+    },
+    "QRO": {
+        "zh-cn": "QRO（高功率）",
+        "en": "QRO (High power)",
+        "ja": "QRO（高電力運用）",
+        "ko": "QRO (고전력 운용)",
+        "description": "表示高功率操作"
+    },
+    "QRS": {
+        "zh-cn": "QRS（降低速度）",
+        "en": "QRS (Send slower)",
+        "ja": "QRS（送信を遅くする）",
+        "ko": "QRS (전송 속도 감소)",
+        "description": "表示降低发送速度"
+    },
+    "QRV": {
+        "zh-cn": "QRV（准备就绪）",
+        "en": "QRV (Ready)",
+        "ja": "QRV（準備完了）",
+        "ko": "QRV (준비 완료)",
+        "description": "表示准备就绪"
+    },
+    "QSK": {
+        "zh-cn": "QSK（打断发射）",
+        "en": "QSK (Break in)",
+        "ja": "QSK（送信を中断）",
+        "ko": "QSK (전송 중단)",
+        "description": "表示中断发射"
+    },
+    "QTR": {
+        "zh-cn": "QTR（时间）",
+        "en": "QTR (Time)",
+        "ja": "QTR（時間）",
+        "ko": "QTR (시간)",
+        "description": "表示时间"
+    },
+    "QTX": {
+        "zh-cn": "QTX（等待）",
+        "en": "QTX (Wait)",
+        "ja": "QTX（待機）",
+        "ko": "QTX (대기)",
+        "description": "表示等待"
+    },
+    "QUA": {
+        "zh-cn": "QUA（天线）",
+        "en": "QUA (Antenna)",
+        "ja": "QUA（アンテナ）",
+        "ko": "QUA (안테나)",
+        "description": "表示天线"
+    },
+    "QUD": {
+        "zh-cn": "QUD（天线方向）",
+        "en": "QUD (Antenna direction)",
+        "ja": "QUD（アンテナ方向）",
+        "ko": "QUD (안테나 방향)",
+        "description": "表示天线方向"
+    },
+    "QUF": {
+        "zh-cn": "QUF（天线高度）",
+        "en": "QUF (Antenna height)",
+        "ja": "QUF（アンテナ高さ）",
+        "ko": "QUF (안테나 높이)",
+        "description": "表示天线高度"
+    },
+    "QUG": {
+        "zh-cn": "QUG（天线增益）",
+        "en": "QUG (Antenna gain)",
+        "ja": "QUG（アンテナ利得）",
+        "ko": "QUG (안테나 이득)",
+        "description": "表示天线增益"
+    },
+    "QUH": {
+        "zh-cn": "QUH（天线类型）",
+        "en": "QUH (Antenna type)",
+        "ja": "QUH（アンテナタイプ）",
+        "ko": "QUH (안테나 유형)",
+        "description": "表示天线类型"
+    },
+    "QUI": {
+        "zh-cn": "QUI（天线阻抗）",
+        "en": "QUI (Antenna impedance)",
+        "ja": "QUI（アンテナインピーダンス）",
+        "ko": "QUI (안테나 임피던스)",
+        "description": "表示天线阻抗"
+    },
+    "QUJ": {
+        "zh-cn": "QUJ（天线驻波比）",
+        "en": "QUJ (Antenna SWR)",
+        "ja": "QUJ（アンテナSWR）",
+        "ko": "QUJ (안테나 SWR)",
+        "description": "表示天线驻波比"
+    },
+    "QUK": {
+        "zh-cn": "QUK（天线带宽）",
+        "en": "QUK (Antenna bandwidth)",
+        "ja": "QUK（アンテナ帯域）",
+        "ko": "QUK (안테나 대역폭)",
+        "description": "表示天线带宽"
+    },
+    "QUL": {
+        "zh-cn": "QUL（天线效率）",
+        "en": "QUL (Antenna efficiency)",
+        "ja": "QUL（アンテナ効率）",
+        "ko": "QUL (안테나 효율)",
+        "description": "表示天线效率"
+    },
+    "QUM": {
+        "zh-cn": "QUM（天线方向图）",
+        "en": "QUM (Antenna pattern)",
+        "ja": "QUM（アンテナパターン）",
+        "ko": "QUM (안테나 패턴)",
+        "description": "表示天线方向图"
+    },
+    "QUN": {
+        "zh-cn": "QUN（天线极化）",
+        "en": "QUN (Antenna polarization)",
+        "ja": "QUN（アンテナ偏波）",
+        "ko": "QUN (안테나 극화)",
+        "description": "表示天线极化"
+    },
+    "QUO": {
+        "zh-cn": "QUO（天线匹配）",
+        "en": "QUO (Antenna matching)",
+        "ja": "QUO（アンテナマッチング）",
+        "ko": "QUO (안테나 매칭)",
+        "description": "表示天线匹配"
+    },
+    "QUP": {
+        "zh-cn": "QUP（天线调谐）",
+        "en": "QUP (Antenna tuning)",
+        "ja": "QUP（アンテナチューニング）",
+        "ko": "QUP (안테나 튜닝)",
+        "description": "表示天线调谐"
+    },
+    "QUQ": {
+        "zh-cn": "QUQ（天线调谐器）",
+        "en": "QUQ (Antenna tuner)",
+        "ja": "QUQ（アンテナチューナー）",
+        "ko": "QUQ (안테나 튜너)",
+        "description": "表示天线调谐器"
+    },
+    "QUR": {
+        "zh-cn": "QUR（天线旋转器）",
+        "en": "QUR (Antenna rotator)",
+        "ja": "QUR（アンテナローター）",
+        "ko": "QUR (안테나 회전기)",
+        "description": "表示天线旋转器"
+    },
+    "QUS": {
+        "zh-cn": "QUS（天线开关）",
+        "en": "QUS (Antenna switch)",
+        "ja": "QUS（アンテナスイッチ）",
+        "ko": "QUS (안테나 스위치)",
+        "description": "表示天线开关"
+    },
+    "QUT": {
+        "zh-cn": "QUT（天线塔）",
+        "en": "QUT (Antenna tower)",
+        "ja": "QUT（アンテナ塔）",
+        "ko": "QUT (안테나 탑)",
+        "description": "表示天线塔"
+    },
+    "QUU": {
+        "zh-cn": "QUU（天线支架）",
+        "en": "QUU (Antenna support)",
+        "ja": "QUU（アンテナ支持）",
+        "ko": "QUU (안테나 지지)",
+        "description": "表示天线支架"
+    },
+    "QUV": {
+        "zh-cn": "QUV（天线馈线）",
+        "en": "QUV (Antenna feedline)",
+        "ja": "QUV（アンテナ給電線）",
+        "ko": "QUV (안테나 송전선)",
+        "description": "表示天线馈线"
+    },
+    "QUW": {
+        "zh-cn": "QUW（天线地网）",
+        "en": "QUW (Antenna ground plane)",
+        "ja": "QUW（アンテナ地面）",
+        "ko": "QUW (안테나 지면)",
+        "description": "表示天线地网"
+    },
+    "QUX": {
+        "zh-cn": "QUX（天线地线）",
+        "en": "QUX (Antenna ground)",
+        "ja": "QUX（アンテナ接地線）",
+        "ko": "QUX (안테나 접지선)",
+        "description": "表示天线地线"
+    },
+    "QUY": {
+        "zh-cn": "QUY（天线地线系统）",
+        "en": "QUY (Antenna ground system)",
+        "ja": "QUY（アンテナ接地システム）",
+        "ko": "QUY (안테나 접지 시스템)",
+        "description": "表示天线地线系统"
+    },
+    "QUZ": {
+        "zh-cn": "QUZ（天线地线系统类型）",
+        "en": "QUZ (Antenna ground system type)",
+        "ja": "QUZ（アンテナ接地システムタイプ）",
+        "ko": "QUZ (안테나 접지 시스템 유형)",
+        "description": "表示天线地线系统类型"
+    }
+}

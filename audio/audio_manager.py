@@ -11,18 +11,26 @@ from collections import deque, namedtuple
 import logging
 from translation.subtitle_file_manager import SubtitleFileManager
 import torch
+from audio.audio_processor import AudioProcessor
+from config import config  # 添加 config 导入
 
 # 调试开关，控制是否输出调试信息到控制台
 DEBUG_MODE = False
 
 # 配置日志记录
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='whisper_model.log',
-    filemode='a'
-)
 logger = logging.getLogger('whisper_model')
+logger.setLevel(logging.INFO)
+
+# 创建文件处理器
+file_handler = logging.FileHandler('whisper_model.log', mode='a', encoding='utf-8')
+file_handler.setLevel(logging.INFO)
+
+# 创建格式化器
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+
+# 添加处理器到日志记录器
+logger.addHandler(file_handler)
 
 # 用于存储识别结果和时间信息的数据结构
 RecognitionResult = namedtuple('RecognitionResult', ['text', 'language', 'delay_ms'])
@@ -40,7 +48,11 @@ class AudioManager:
         self.stream = None
         self.pyaudio_instance = None
         self.detected_language = None  # 存储检测到的语言
-        self.model = None
+        
+        # 使用AudioProcessor处理音频识别
+        self.audio_processor = AudioProcessor()
+        
+        # 记录当前模型名称，仅用于UI显示
         self.current_model_name = None
         
         # 时间统计
@@ -55,68 +67,125 @@ class AudioManager:
         # 字幕文件管理器
         self.subtitle_manager = SubtitleFileManager()
         
-        # 从配置文件读取模型设置并加载模型
-        from config import config
-        model_name = config.get("whisper_model", "base")
-        self.load_model(model_name)
+        # 音频延迟缓冲区
+        self.audio_delay_enabled = False
+        self.audio_delay_ms = 0
+        self.audio_buffer = deque()
         
-    def load_model(self, model_name):
+        # 从配置文件读取模型设置
+        self.current_model_name = config.get("whisper_model", "base")
+        
+        # 初始化 PyAudio
+        self._init_pyaudio()
+        
+    def _init_pyaudio(self):
+        """初始化 PyAudio 实例"""
+        try:
+            if self.pyaudio_instance is None:
+                self.pyaudio_instance = pyaudio.PyAudio()
+                print("PyAudio 实例初始化成功")
+        except Exception as e:
+            print(f"初始化 PyAudio 失败: {str(e)}")
+            self.pyaudio_instance = None
+            
+    def _cleanup_pyaudio(self):
+        """清理 PyAudio 实例"""
+        try:
+            # 先停止所有活动的流
+            if hasattr(self, 'stream') and self.stream:
+                try:
+                    if self.stream.is_active():
+                        self.stream.stop_stream()
+                    self.stream.close()
+                except Exception as e:
+                    print(f"关闭输入流时出错: {str(e)}")
+                finally:
+                    self.stream = None
+                    
+            if hasattr(self, 'output_stream') and self.output_stream:
+                try:
+                    if self.output_stream.is_active():
+                        self.output_stream.stop_stream()
+                    self.output_stream.close()
+                except Exception as e:
+                    print(f"关闭输出流时出错: {str(e)}")
+                finally:
+                    self.output_stream = None
+            
+            # 清理缓冲区
+            if hasattr(self, 'audio_buffer'):
+                self.audio_buffer.clear()
+            
+            # 最后终止 PyAudio 实例
+            if self.pyaudio_instance:
+                self.pyaudio_instance.terminate()
+                self.pyaudio_instance = None
+                print("PyAudio 实例已清理")
+        except Exception as e:
+            print(f"清理 PyAudio 实例时出错: {str(e)}")
+            
+    def load_model(self, model_name, callback=None):
         """
-        加载指定的Whisper模型
+        更新模型配置并立即加载模型
         
         参数:
             model_name (str): 模型名称 (tiny, base, small, medium, large)
+            callback (function): 可选的回调函数，模型加载完成后调用
             
         返回:
-            bool: 是否成功加载模型
+            bool: 配置是否成功更新和模型是否成功加载
         """
-        if self.current_model_name == model_name and self.model is not None:
-            logger.info(f"模型 {model_name} 已经加载，不需要重新加载")
-            return True
-            
         try:
-            logger.info(f"开始加载模型: {model_name}")
-            # 检查模型文件是否存在
-            model_dir = os.path.expanduser("~/.cache/whisper")
-            model_exists = False
+            # 记录开始加载
+            print(f"开始加载模型 {model_name}")
             
-            if os.path.exists(model_dir):
-                for fname in os.listdir(model_dir):
-                    if model_name in fname:
-                        model_exists = True
-                        break
-            
-            if not model_exists:
-                logger.warning(f"模型文件 {model_name} 不存在，将下载模型(这可能需要一些时间)")
-            
-            # 从配置获取设备设置
-            from config import config
-            use_gpu = config.get("use_gpu", True)
-            device = "cuda" if use_gpu and torch.cuda.is_available() else "cpu"
-            
-            if DEBUG_MODE:
-                print(f"加载模型 {model_name} 使用设备: {device}")
-                
-            # 加载模型，指定设备
-            self.model = whisper.load_model(model_name, device=device)
+            # 更新配置和当前模型名称记录
+            config.set("whisper_model", model_name) # 确保配置文件也被更新
             self.current_model_name = model_name
-            logger.info(f"成功加载模型: {model_name}, 设备: {device}")
+            
+            # 更新处理器中的模型配置
+            self.audio_processor.update_model(model_name)
+            
+            # 立即加载模型 - 这会阻塞直到模型加载完成
+            start_time = time.time()
+            model = self.audio_processor.get_model()
+            load_time = time.time() - start_time
+            
+            # 记录加载时间
+            logger.info(f"模型 {model_name} 已成功加载，用时 {load_time:.2f} 秒")
+            print(f"模型 {model_name} 已成功加载，用时 {load_time:.2f} 秒")
+            
+            # 获取实际加载的模型名称（可能与请求的不同，比如自动降级）
+            actual_model_name = self.audio_processor.current_model_name or model_name
+            self.current_model_name = actual_model_name
+            
+            # 如果提供了回调函数，则调用它
+            if callback:
+                try:
+                    print(f"直接调用回调函数: model_name={actual_model_name}, success=True")
+                    callback(actual_model_name, True)
+                except Exception as callback_error:
+                    print(f"调用回调函数出错: {str(callback_error)}")
+            
+            # 模型加载成功
             return True
+            
         except Exception as e:
             error_msg = f"加载模型 {model_name} 失败: {str(e)}"
             logger.error(error_msg)
-            if DEBUG_MODE:
-                print(error_msg)
-                
-            # 如果当前没有模型，则尝试加载base模型作为后备
-            if self.model is None:
+            print(error_msg)
+            
+            # 重置当前模型名称
+            self.current_model_name = None
+            
+            # 如果提供了回调函数，通知加载失败
+            if callback:
                 try:
-                    logger.info("尝试加载备用模型: base")
-                    self.model = whisper.load_model("base")
-                    self.current_model_name = "base"
-                    logger.info("成功加载备用模型: base")
-                except Exception as e2:
-                    logger.critical(f"加载备用模型也失败: {str(e2)}")
+                    print(f"直接调用回调函数(失败): model_name={model_name}, success=False")
+                    callback(model_name, False)
+                except Exception as callback_error:
+                    print(f"调用回调函数出错: {str(callback_error)}")
+                
             return False
     
     def get_input_devices(self):
@@ -124,10 +193,56 @@ class AudioManager:
         p = pyaudio.PyAudio()
         devices = []
         
-        for i in range(p.get_device_count()):
-            device_info = p.get_device_info_by_index(i)
-            if device_info['maxInputChannels'] > 0:
-                devices.append(f"{device_info['name']} (Index: {i})")
+        try:
+            for i in range(p.get_device_count()):
+                try:
+                    device_info = p.get_device_info_by_index(i)
+                    if device_info['maxInputChannels'] > 0:
+                        # 处理设备名称可能的编码问题
+                        device_name = device_info['name']
+                        
+                        # 如果设备名称包含特殊字符或可能导致乱码的字符，尝试清理
+                        try:
+                            # 尝试解码/编码设备名称以验证其有效性
+                            if isinstance(device_name, bytes):
+                                device_name = device_name.decode('utf-8', errors='ignore')
+                            
+                            # 过滤掉一些已知问题的字符序列
+                            import re
+                            # 删除特殊控制字符
+                            device_name = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', device_name)
+                            # 删除一些常见的乱码标志
+                            device_name = re.sub(r'[\uFFFD\uFFFE\uFFFF]', '', device_name)
+                            
+                            # 如果设备名称中包含系统路径，这可能表明有问题
+                            if '@System32\\' in device_name or '\\??\\' in device_name:
+                                # 尝试提取一个更友好的名称
+                                friendly_parts = re.findall(r'#(\w+)$|%(\w+)|\\(\w+)\)', device_name)
+                                if friendly_parts:
+                                    # 使用找到的所有非空部分
+                                    friendly_name = ''.join([part for group in friendly_parts for part in group if part])
+                                    if friendly_name:
+                                        device_name = f"音频设备 {friendly_name}"
+                                    else:
+                                        device_name = f"音频设备 {i}"
+                                else:
+                                    device_name = f"音频设备 {i}"
+                            
+                            # 确保最终名称不为空
+                            if not device_name.strip():
+                                device_name = f"音频设备 {i}"
+                                
+                        except Exception as e:
+                            print(f"处理设备名称时出错: {str(e)}")
+                            device_name = f"音频设备 {i}"
+                        
+                        # 添加设备信息到列表
+                        devices.append(f"{device_name} (Index: {i})")
+                except Exception as e:
+                    print(f"获取设备 {i} 信息时出错: {str(e)}")
+                    devices.append(f"未知设备 {i} (Index: {i})")
+        except Exception as e:
+            print(f"枚举音频设备时出错: {str(e)}")
         
         p.terminate()
         return devices
@@ -137,10 +252,56 @@ class AudioManager:
         p = pyaudio.PyAudio()
         devices = []
         
-        for i in range(p.get_device_count()):
-            device_info = p.get_device_info_by_index(i)
-            if device_info['maxOutputChannels'] > 0:
-                devices.append(f"{device_info['name']} (Index: {i})")
+        try:
+            for i in range(p.get_device_count()):
+                try:
+                    device_info = p.get_device_info_by_index(i)
+                    if device_info['maxOutputChannels'] > 0:
+                        # 处理设备名称可能的编码问题
+                        device_name = device_info['name']
+                        
+                        # 如果设备名称包含特殊字符或可能导致乱码的字符，尝试清理
+                        try:
+                            # 尝试解码/编码设备名称以验证其有效性
+                            if isinstance(device_name, bytes):
+                                device_name = device_name.decode('utf-8', errors='ignore')
+                            
+                            # 过滤掉一些已知问题的字符序列
+                            import re
+                            # 删除特殊控制字符
+                            device_name = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', device_name)
+                            # 删除一些常见的乱码标志
+                            device_name = re.sub(r'[\uFFFD\uFFFE\uFFFF]', '', device_name)
+                            
+                            # 如果设备名称中包含系统路径，这可能表明有问题
+                            if '@System32\\' in device_name or '\\??\\' in device_name:
+                                # 尝试提取一个更友好的名称
+                                friendly_parts = re.findall(r'#(\w+)$|%(\w+)|\\(\w+)\)', device_name)
+                                if friendly_parts:
+                                    # 使用找到的所有非空部分
+                                    friendly_name = ''.join([part for group in friendly_parts for part in group if part])
+                                    if friendly_name:
+                                        device_name = f"音频设备 {friendly_name}"
+                                    else:
+                                        device_name = f"音频设备 {i}"
+                                else:
+                                    device_name = f"音频设备 {i}"
+                            
+                            # 确保最终名称不为空
+                            if not device_name.strip():
+                                device_name = f"音频设备 {i}"
+                                
+                        except Exception as e:
+                            print(f"处理设备名称时出错: {str(e)}")
+                            device_name = f"音频设备 {i}"
+                        
+                        # 添加设备信息到列表
+                        devices.append(f"{device_name} (Index: {i})")
+                except Exception as e:
+                    print(f"获取设备 {i} 信息时出错: {str(e)}")
+                    devices.append(f"未知设备 {i} (Index: {i})")
+        except Exception as e:
+            print(f"枚举音频设备时出错: {str(e)}")
         
         p.terminate()
         return devices
@@ -150,6 +311,15 @@ class AudioManager:
         if self.is_running:
             return
         
+        # 确保之前的资源已清理
+        self._cleanup_pyaudio()
+        
+        # 确保 PyAudio 实例存在
+        self._init_pyaudio()
+        if self.pyaudio_instance is None:
+            print("无法启动录音：PyAudio 实例初始化失败")
+            return
+            
         self.is_running = True
         self.input_device = input_device
         self.output_device = output_device
@@ -157,15 +327,43 @@ class AudioManager:
         # 重置时间统计
         self.recognition_delay = 0
         
+        # 从配置中读取延迟设置
+        self.audio_delay_enabled = config.get("audio_delay_enabled", False)
+        self.audio_delay_ms = config.get("audio_delay_ms", 0) if self.audio_delay_enabled else 0
+        
         # 提取设备索引
-        input_index = int(input_device.split("Index: ")[-1].rstrip(")"))
-        output_index = int(output_device.split("Index: ")[-1].rstrip(")")) if output_device else None
+        try:
+            # 尝试从字符串中提取设备索引
+            import re
+            input_index_match = re.search(r'Index: (\d+)', input_device)
+            if input_index_match:
+                self.input_device_index = int(input_index_match.group(1))
+                print(f"使用输入设备索引: {self.input_device_index}")
+            else:
+                print(f"无法从'{input_device}'提取输入设备索引，使用默认设备")
+                self.input_device_index = None
+            
+            # 处理输出设备索引
+            if output_device:
+                output_index_match = re.search(r'Index: (\d+)', output_device)
+                if output_index_match:
+                    self.output_device_index = int(output_index_match.group(1))
+                    print(f"使用输出设备索引: {self.output_device_index}")
+                else:
+                    print(f"无法从'{output_device}'提取输出设备索引，不使用输出设备")
+                    self.output_device_index = None
+            else:
+                self.output_device_index = None
+        except Exception as e:
+            print(f"提取设备索引时出错: {str(e)}")
+            self.input_device_index = None
+            self.output_device_index = None
         
         # 启动字幕记录
         self.subtitle_manager.start_recording()
         
         # 启动录音线程
-        self.recording_thread = threading.Thread(target=self._record_audio, args=(input_index, output_index))
+        self.recording_thread = threading.Thread(target=self._record_audio)
         self.recording_thread.daemon = True
         self.recording_thread.start()
         
@@ -173,7 +371,11 @@ class AudioManager:
         self.recognition_thread = threading.Thread(target=self._recognize_audio)
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
-    
+        
+        print(f"开始录音 - 输入设备: {input_device}, 输出设备: {output_device}")
+        if self.audio_delay_enabled:
+            print(f"音频延迟已启用: {self.audio_delay_ms} 毫秒")
+            
     def stop_recording(self):
         """停止录音和识别"""
         self.is_running = False
@@ -181,75 +383,227 @@ class AudioManager:
         # 停止字幕记录
         self.subtitle_manager.stop_recording()
         
-        if self.stream and self.stream.is_active():
-            self.stream.stop_stream()
-            self.stream.close()
-        
-        if self.pyaudio_instance:
-            self.pyaudio_instance.terminate()
-            self.pyaudio_instance = None
-        
         # 等待线程结束
         if self.recording_thread:
-            self.recording_thread.join(timeout=1)
+            try:
+                self.recording_thread.join(timeout=1)
+            except Exception as e:
+                print(f"等待录音线程结束时出错: {str(e)}")
         
         if self.recognition_thread:
-            self.recognition_thread.join(timeout=1)
+            try:
+                self.recognition_thread.join(timeout=1)
+            except Exception as e:
+                print(f"等待识别线程结束时出错: {str(e)}")
+        
+        # 清理音频资源
+        self._cleanup_pyaudio()
     
-    def _record_audio(self, input_index, output_index=None):
-        """录制音频并放入队列"""
-        self.pyaudio_instance = pyaudio.PyAudio()
+    def set_audio_delay(self, delay_ms):
+        """设置音频延迟时间
         
-        # 准备音频缓冲区
-        frames = []
-        buffer_seconds = 0
-        
-        # 创建音频流
-        def callback(in_data, frame_count, time_info, status):
-            frames.append(in_data)
-            return (in_data, pyaudio.paContinue)
-        
-        self.stream = self.pyaudio_instance.open(
-            format=pyaudio.paInt16,
-            channels=self.channels,
-            rate=self.sample_rate,
-            input=True,
-            output=output_index is not None,
-            input_device_index=input_index,
-            output_device_index=output_index,
-            frames_per_buffer=self.chunk_size,
-            stream_callback=callback if output_index else None
-        )
-        
-        if not output_index:
-            self.stream.start_stream()
-        
-        # 循环录制直到停止
-        while self.is_running:
-            if not output_index:
-                data = self.stream.read(self.chunk_size)
-                frames.append(data)
-            
-            # 计算已录制的时间
-            buffer_seconds = len(frames) * self.chunk_size / self.sample_rate
-            
-            # 如果已经录制足够长度，则处理并发送到识别队列
-            if buffer_seconds >= self.record_seconds:
-                # 将帧组合成一个音频段
-                audio_data = b''.join(frames)
+        参数:
+            delay_ms (int): 延迟时间（毫秒）
+        """
+        try:
+            if delay_ms > 0:
+                self.audio_delay_enabled = True
+                self.audio_delay_ms = delay_ms
+                print(f"音频延迟已设置为 {delay_ms} 毫秒")
                 
-                # 记录音频段的开始时间，用于计算延迟
-                start_time = time.time()
+                # 保存到配置
+                config.set("audio_delay_enabled", True)
+                config.set("audio_delay_ms", delay_ms)
+            else:
+                self.audio_delay_enabled = False
+                self.audio_delay_ms = 0
+                print("音频延迟已禁用")
                 
-                # 发送到识别队列（包含时间戳）
-                self.audio_queue.put((audio_data, start_time))
-                
-                # 清空缓冲区，保留最后0.5秒的数据（可能有未完成的句子）
-                overlap_frames = int(0.5 * self.sample_rate / self.chunk_size)
-                frames = frames[-overlap_frames:] if overlap_frames < len(frames) else []
+                # 保存到配置
+                config.set("audio_delay_enabled", False)
+                config.set("audio_delay_ms", 0)
+        except Exception as e:
+            print(f"设置音频延迟时出错: {str(e)}")
+            self.audio_delay_enabled = False
+            self.audio_delay_ms = 0
             
-            # 短暂休眠以减少CPU使用
-            time.sleep(0.01)
+    def _record_audio(self):
+        """录制音频"""
+        try:
+            # 获取当前配置的音频延迟设置
+            delay_enabled = config.get("audio_delay_enabled", False)
+            delay_ms = config.get("audio_delay_ms", 0)
+            monitor_enabled = config.get("monitor_enabled", False)
+            
+            print(f"音频设置: 延迟={delay_enabled}, 延迟时间={delay_ms}ms, 监听={monitor_enabled}")
+            
+            # 延迟播放缓冲区
+            audio_delay_buffer = []
+            
+            # 记录开始时间
+            recognition_start_time = time.time()
+            
+            # 用于存储上一次识别的文本
+            last_recognized_text = ""
+            
+            # 创建音频流
+            try:
+                if self.pyaudio_instance is None:
+                    print("PyAudio 实例不存在，尝试重新初始化")
+                    self._init_pyaudio()
+                    if self.pyaudio_instance is None:
+                        print("无法创建音频流：PyAudio 实例初始化失败")
+                        return
+                
+                # 创建输入流
+                self.stream = self.pyaudio_instance.open(
+                    format=pyaudio.paInt16,
+                    channels=self.channels,
+                    rate=self.sample_rate,
+                    input=True,
+                    frames_per_buffer=self.chunk_size,
+                    input_device_index=self.input_device_index if hasattr(self, 'input_device_index') else None
+                )
+                
+                # 如果启用了监听，创建输出流
+                if monitor_enabled:
+                    self.output_stream = self.pyaudio_instance.open(
+                        format=pyaudio.paInt16,
+                        channels=self.channels,
+                        rate=self.sample_rate,
+                        output=True,
+                        frames_per_buffer=self.chunk_size,
+                        output_device_index=self.output_device_index if hasattr(self, 'output_device_index') else None
+                    )
+                    print("音频监听已启用")
+                
+                print(f"音频流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}, 块大小={self.chunk_size}")
+            except Exception as e:
+                print(f"创建音频流失败: {str(e)}")
+                return
+            
+            # 音频识别缓冲区
+            recognition_buffer = []
+            recognition_buffer_duration = 0  # 当前缓冲区时长（秒）
+            
+            # 性能监控变量
+            frame_count = 0
+            start_performance_time = time.time()
+            
+            # 减少record_seconds，降低延迟
+            record_seconds = 1.5  # 优化: 减少每次处理的时间
+            
+            # 如果启用了延迟，计算延迟帧数
+            delay_frames = 0
+            if delay_enabled and delay_ms > 0:
+                delay_frames = int((delay_ms / 1000.0) * self.sample_rate / self.chunk_size)
+                print(f"延迟设置: {delay_frames} 帧 (约 {delay_ms} 毫秒)")
+            
+            while self.is_running:
+                try:
+                    # 读取音频数据
+                    audio_data = self.stream.read(self.chunk_size, exception_on_overflow=False)
+                    
+                    # 性能监控
+                    frame_count += 1
+                    if frame_count % 100 == 0:  # 每100帧输出一次性能信息
+                        current_time = time.time()
+                        elapsed = current_time - start_performance_time
+                        fps = 100 / elapsed if elapsed > 0 else 0
+                        if DEBUG_MODE:
+                            print(f"音频处理性能: {fps:.2f} 帧/秒")
+                        start_performance_time = current_time
+                    
+                    # 将音频数据转换为numpy数组
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    
+                    # 检查音频数据是否有效
+                    if np.max(np.abs(audio_array)) < 100:  # 如果音量太小，可能是静音
+                        continue
+                    
+                    # 处理延迟音频播放
+                    if monitor_enabled and hasattr(self, 'output_stream'):
+                        try:
+                            if delay_enabled and delay_ms > 0:
+                                # 将当前帧添加到延迟缓冲区
+                                audio_delay_buffer.append(audio_data)
+                                
+                                # 当缓冲区达到延迟帧数时开始播放
+                                if len(audio_delay_buffer) > delay_frames:
+                                    # 获取最早的帧进行播放
+                                    play_data = audio_delay_buffer.pop(0)
+                                    self.output_stream.write(play_data)
+                            else:
+                                # 直接播放，无延迟
+                                self.output_stream.write(audio_data)
+                        except Exception as e:
+                            print(f"播放音频时出错: {str(e)}")
+                    
+                    # 转换为float32并归一化（用于识别）
+                    audio_float = audio_array.astype(np.float32) / 32768.0
+                    
+                    # 将音频数据添加到识别缓冲区
+                    recognition_buffer.append(audio_float)
+                    recognition_buffer_duration += self.chunk_size / self.sample_rate
+                    
+                    # 当识别缓冲区达到指定时长时进行处理
+                    if recognition_buffer_duration >= record_seconds:
+                        # 记录识别开始时间
+                        rec_start = time.time()
+                        
+                        # 合并音频数据
+                        recognition_data = np.concatenate(recognition_buffer)
+                        
+                        # 使用音频处理器进行识别
+                        result = self.audio_processor.process_audio(recognition_data)
+                        recognized_text = result.get("text", "")
+                        detected_language = result.get("language")
+                        
+                        # 计算本次识别实际耗时
+                        rec_end = time.time()
+                        proc_time = int((rec_end - rec_start) * 1000)
+                        
+                        # 检查是否与上一次识别的文本相同
+                        if recognized_text and recognized_text != last_recognized_text:
+                            # 更新上一次识别的文本
+                            last_recognized_text = recognized_text
+                            
+                            # 将识别结果放入队列
+                            self.result_queue.append(RecognitionResult(
+                                text=recognized_text,
+                                language=detected_language,
+                                delay_ms=proc_time
+                            ))
+                            self.text_queue.append(recognized_text)
+                            
+                            # 添加到字幕管理器
+                            self.subtitle_manager.add_subtitle(recognized_text)
+                            
+                            # 更新识别延迟
+                            self.recognition_delay = proc_time
+                            
+                            # 记录日志
+                            if DEBUG_MODE:
+                                print(f"识别文本: {recognized_text[:50]}... (语言: {detected_language}, 延迟: {proc_time}ms)")
+                            logger.info(f"识别文本: {recognized_text[:50]}... (语言: {detected_language}, 延迟: {proc_time}ms)")
+                        
+                        # 清空缓冲区，但保留最后0.2秒的数据，减少延迟
+                        overlap_samples = int(0.2 * self.sample_rate)
+                        if len(recognition_buffer) > 0:
+                            recognition_buffer = [recognition_buffer[-1]]  # 只保留最后一个块
+                            recognition_buffer_duration = self.chunk_size / self.sample_rate
+                    
+                except Exception as e:
+                    print(f"处理音频数据时出错: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            print(f"录制音频时出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 清理资源
+            self._cleanup_pyaudio()
     
     def _recognize_audio(self):
         """使用Whisper模型识别音频"""
@@ -258,58 +612,92 @@ class AudioManager:
                 # 尝试从队列获取音频数据和开始时间（等待最多0.5秒）
                 audio_data, start_time = self.audio_queue.get(timeout=0.5)
                 
-                # 将二进制音频数据转换为NumPy数组
-                audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                # 检查是否是large模型，如果是则需要更谨慎地处理数据
+                is_large_model = self.current_model_name == "large"
                 
-                # 确保模型已加载
-                if self.model is None:
-                    logger.error("无法进行语音识别：模型未加载")
-                    self.audio_queue.task_done()
-                    continue
+                try:
+                    # 将二进制音频数据转换为NumPy数组
+                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # 确保数据是一维数组
+                    if len(audio_np.shape) > 1:
+                        audio_np = audio_np.flatten()
+                    
+                    # 对于large模型，可能需要额外检查
+                    if is_large_model:
+                        # 检查数据长度是否合适
+                        if len(audio_np) < self.sample_rate:  # 小于1秒
+                            logger.warning(f"音频片段过短: {len(audio_np)/self.sample_rate:.2f}秒，可能无法识别")
+                            # 复制数据以达到最小长度
+                            repeats = int(np.ceil(self.sample_rate / max(1, len(audio_np))))
+                            audio_np = np.tile(audio_np, repeats)[:self.sample_rate]
+                    
+                    # 开始计时
+                    rec_start = time.time()
+                    
+                    # 使用AudioProcessor处理音频识别
+                    recognition_result = self.audio_processor.process_audio(audio_np)
+                    
+                    # 计算处理时间
+                    proc_time = int((time.time() - rec_start) * 1000)
+                    
+                    # 从结果中提取文本和语言
+                    text = recognition_result.get("text", "")
+                    detected_language = recognition_result.get("language")
+                    
+                    # 保存检测到的语言代码
+                    self.detected_language = detected_language
+                    
+                    if DEBUG_MODE:
+                        print(f"检测到语言: {detected_language}, 文本: {text[:50] if text else '无'}")
+                    
+                    # 如果有有效文本，保存结果
+                    if text:
+                        # 计算延迟（毫秒）- 使用处理时间而非总时间
+                        self.recognition_delay = proc_time
+                        
+                        # 保存识别结果
+                        result = RecognitionResult(text=text, language=detected_language, delay_ms=proc_time)
+                        self.result_queue.append(result)
+                        self.text_queue.append(text)
+                        
+                        # 添加到字幕管理器
+                        self.subtitle_manager.add_subtitle(text)
+                        
+                        # 记录日志
+                        if DEBUG_MODE:
+                            print(f"识别文本: {text[:50]}... (延迟: {proc_time}ms, 语言: {detected_language})")
+                        logger.info(f"识别文本: {text[:50]}... (延迟: {proc_time}ms, 语言: {detected_language})")
                 
-                # 使用Whisper模型进行语音识别
-                result = self.model.transcribe(audio_np, fp16=False)
-                
-                # 获取识别的文本
-                text = result["text"].strip()
-                
-                # 获取检测到的语言
-                language_code = result.get("language", None)
-                if language_code:
-                    self.detected_language = language_code
-                    logger.info(f"检测到语言: {self.detected_language}")
-                
-                if text:
-                    # 计算识别延迟（从录音到识别完成的时间）
-                    end_time = time.time()
-                    delay_ms = int((end_time - start_time) * 1000)
-                    
-                    # 保存识别结果及延迟信息
-                    self.recognition_delay = delay_ms
-                    logger.info(f"语音识别延迟: {delay_ms}ms")
-                    
-                    # 将识别的文本添加到队列
-                    self.text_queue.append(text)
-                    
-                    # 将完整识别结果添加到结果队列
-                    result = RecognitionResult(text=text, language=language_code, delay_ms=delay_ms)
-                    self.result_queue.append(result)
-                    
-                    # 添加到字幕管理器
-                    self.subtitle_manager.add_subtitle(text)
-                    
-                    logger.debug(f"识别文本: {text[:50]}...")
+                except Exception as inner_e:
+                    error_msg = f"音频数据处理错误: {str(inner_e)}"
+                    logger.error(error_msg)
+                    if DEBUG_MODE or is_large_model:
+                        print(error_msg)
+                        
+                        # 对于large模型，提供更详细的错误信息
+                        if is_large_model:
+                            import traceback
+                            print(f"Large模型处理详细错误信息:")
+                            traceback.print_exc()
                 
                 # 标记任务完成
                 self.audio_queue.task_done()
                 
             except queue.Empty:
-                # 队列为空，等待更多音频数据
-                pass
+                # 队列为空，继续等待
+                continue
             except Exception as e:
-                error_msg = f"识别音频错误: {e}"
+                # 记录错误但继续处理
+                error_msg = f"音频识别错误: {str(e)}"
                 logger.error(error_msg)
-                print(error_msg)
+                if DEBUG_MODE:
+                    print(error_msg)
+                # 确保任务被标记为完成
+                try:
+                    self.audio_queue.task_done()
+                except:
+                    pass
     
     def get_latest_text(self):
         """获取最新识别的文本"""
