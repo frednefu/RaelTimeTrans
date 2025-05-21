@@ -95,8 +95,16 @@ class AudioProcessor:
             # 获取源语言设置
             source_language = config.get("source_language", "auto")
             
+            # 打印源语言设置
+            print(f"当前源语言设置: {source_language}")
+            
             # 每次处理都获取当前配置的模型
             model = self.get_model()
+            
+            # 记录输入音频的基本信息
+            print(f"处理音频数据: 类型={type(audio_data)}, 是否为numpy数组={isinstance(audio_data, np.ndarray)}")
+            if isinstance(audio_data, np.ndarray):
+                print(f"输入音频: 形状={audio_data.shape}, 类型={audio_data.dtype}, 最大值={np.max(audio_data):.6f}, 最小值={np.min(audio_data):.6f}")
             
             # 确保音频数据是numpy数组
             if not isinstance(audio_data, np.ndarray):
@@ -134,9 +142,19 @@ class AudioProcessor:
                 print(f"警告: 音频数据超出[-1,1]范围，最大绝对值是 {max_abs}，将其归一化")
                 audio_data = audio_data / max_abs
             
+            # 检查音频是否有信号（避免全0或接近0的数据）
+            rms = np.sqrt(np.mean(np.square(audio_data)))
+            if rms < 0.001:  # 非常小的RMS值表示几乎没有声音
+                print(f"警告: 音频信号非常弱 (RMS = {rms:.6f})，可能无法识别")
+            else:
+                print(f"音频信号强度 RMS = {rms:.6f}")
+            
             # 记录音频数据的统计信息，但仅在启用时显示
             if config.get("show_audio_stats", False):
                 print(f"音频数据统计: 类型={audio_data.dtype}, 形状={audio_data.shape}, 最小值={np.min(audio_data)}, 最大值={np.max(audio_data)}")
+            
+            # 总是打印处理后的音频信息
+            print(f"处理后的音频: 形状={audio_data.shape}, 类型={audio_data.dtype}, 最大值={np.max(audio_data):.6f}, 最小值={np.min(audio_data):.6f}")
             
             # 在调用Whisper模型前进行最终检查
             if not isinstance(audio_data, np.ndarray):
@@ -151,11 +169,15 @@ class AudioProcessor:
             
             # 使用Whisper模型进行识别，使用直接的变量而不是可能变化的引用
             try:
+                print(f"开始使用Whisper模型识别音频 (模型: {self.current_model_name}, 设备: {self.device})")
+                
                 result = model.transcribe(
                     whisper_input,
                     language=source_language if source_language != "auto" else None,
                     task="transcribe"
                 )
+                
+                print(f"Whisper模型识别完成")
             except Exception as model_error:
                 print(f"Whisper模型错误: {str(model_error)}")
                 print(f"输入数据信息: 类型={type(whisper_input)}, 是否为numpy={isinstance(whisper_input, np.ndarray)}")
@@ -166,6 +188,8 @@ class AudioProcessor:
             # 返回文本内容和检测到的语言代码
             detected_language = result.get("language")
             transcribed_text = result.get("text", "")
+            
+            print(f"Whisper识别结果: 语言={detected_language}, 文本='{transcribed_text}'")
             
             # 清理识别文本
             if transcribed_text:
@@ -191,6 +215,10 @@ class AudioProcessor:
                 # 如果清理后文本为空，返回空字符串
                 if not transcribed_text.strip():
                     transcribed_text = ""
+                    
+                # 如果文本被清理了，记录一下
+                if transcribed_text != result.get("text", ""):
+                    print(f"文本已清理，清理后: '{transcribed_text}'")
             
             return {
                 "text": transcribed_text,

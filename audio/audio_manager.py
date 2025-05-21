@@ -15,7 +15,7 @@ from audio.audio_processor import AudioProcessor
 from config import config  # 添加 config 导入
 
 # 调试开关，控制是否输出调试信息到控制台
-DEBUG_MODE = False
+DEBUG_MODE = True
 
 # 配置日志记录
 logger = logging.getLogger('whisper_model')
@@ -45,9 +45,13 @@ class AudioManager:
         self.result_queue = deque(maxlen=5)  # 保存最近5条识别结果（含延迟信息）
         self.recording_thread = None
         self.recognition_thread = None
+        self.playback_thread = None  # 新增：专门用于音频播放的线程
         self.stream = None
         self.pyaudio_instance = None
         self.detected_language = None  # 存储检测到的语言
+        
+        # 音频数据队列，用于从录音线程传递到播放线程
+        self.playback_queue = queue.Queue(maxsize=1000)  # 限制队列大小以防内存占用过高
         
         # 使用AudioProcessor处理音频识别
         self.audio_processor = AudioProcessor()
@@ -362,15 +366,21 @@ class AudioManager:
         # 启动字幕记录
         self.subtitle_manager.start_recording()
         
-        # 启动录音线程
+        # 启动录音线程 - 只负责录制音频并送入队列
         self.recording_thread = threading.Thread(target=self._record_audio)
         self.recording_thread.daemon = True
         self.recording_thread.start()
         
-        # 启动识别线程
+        # 启动识别线程 - 只负责从队列获取音频并进行识别
         self.recognition_thread = threading.Thread(target=self._recognize_audio)
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
+        
+        # 如果启用了音频监听，则启动播放线程
+        if config.get("monitor_enabled", False) and output_device:
+            self.playback_thread = threading.Thread(target=self._playback_audio)
+            self.playback_thread.daemon = True
+            self.playback_thread.start()
         
         print(f"开始录音 - 输入设备: {input_device}, 输出设备: {output_device}")
         if self.audio_delay_enabled:
@@ -384,51 +394,18 @@ class AudioManager:
         self.subtitle_manager.stop_recording()
         
         # 等待线程结束
-        if self.recording_thread:
-            try:
-                self.recording_thread.join(timeout=1)
-            except Exception as e:
-                print(f"等待录音线程结束时出错: {str(e)}")
+        for thread in [self.recording_thread, self.recognition_thread, self.playback_thread]:
+            if thread:
+                try:
+                    thread.join(timeout=1)
+                except Exception as e:
+                    print(f"等待线程结束时出错: {str(e)}")
         
-        if self.recognition_thread:
-            try:
-                self.recognition_thread.join(timeout=1)
-            except Exception as e:
-                print(f"等待识别线程结束时出错: {str(e)}")
-        
-        # 清理音频资源
+        # 清理资源
         self._cleanup_pyaudio()
-    
-    def set_audio_delay(self, delay_ms):
-        """设置音频延迟时间
-        
-        参数:
-            delay_ms (int): 延迟时间（毫秒）
-        """
-        try:
-            if delay_ms > 0:
-                self.audio_delay_enabled = True
-                self.audio_delay_ms = delay_ms
-                print(f"音频延迟已设置为 {delay_ms} 毫秒")
-                
-                # 保存到配置
-                config.set("audio_delay_enabled", True)
-                config.set("audio_delay_ms", delay_ms)
-            else:
-                self.audio_delay_enabled = False
-                self.audio_delay_ms = 0
-                print("音频延迟已禁用")
-                
-                # 保存到配置
-                config.set("audio_delay_enabled", False)
-                config.set("audio_delay_ms", 0)
-        except Exception as e:
-            print(f"设置音频延迟时出错: {str(e)}")
-            self.audio_delay_enabled = False
-            self.audio_delay_ms = 0
             
     def _record_audio(self):
-        """录制音频"""
+        """录制音频 - 只负责采集音频并送入队列"""
         try:
             # 获取当前配置的音频延迟设置
             delay_enabled = config.get("audio_delay_enabled", False)
@@ -437,14 +414,8 @@ class AudioManager:
             
             print(f"音频设置: 延迟={delay_enabled}, 延迟时间={delay_ms}ms, 监听={monitor_enabled}")
             
-            # 延迟播放缓冲区
-            audio_delay_buffer = []
-            
             # 记录开始时间
             recognition_start_time = time.time()
-            
-            # 用于存储上一次识别的文本
-            last_recognized_text = ""
             
             # 创建音频流
             try:
@@ -465,19 +436,7 @@ class AudioManager:
                     input_device_index=self.input_device_index if hasattr(self, 'input_device_index') else None
                 )
                 
-                # 如果启用了监听，创建输出流
-                if monitor_enabled:
-                    self.output_stream = self.pyaudio_instance.open(
-                        format=pyaudio.paInt16,
-                        channels=self.channels,
-                        rate=self.sample_rate,
-                        output=True,
-                        frames_per_buffer=self.chunk_size,
-                        output_device_index=self.output_device_index if hasattr(self, 'output_device_index') else None
-                    )
-                    print("音频监听已启用")
-                
-                print(f"音频流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}, 块大小={self.chunk_size}")
+                print(f"音频输入流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}, 块大小={self.chunk_size}")
             except Exception as e:
                 print(f"创建音频流失败: {str(e)}")
                 return
@@ -492,12 +451,6 @@ class AudioManager:
             
             # 减少record_seconds，降低延迟
             record_seconds = 1.5  # 优化: 减少每次处理的时间
-            
-            # 如果启用了延迟，计算延迟帧数
-            delay_frames = 0
-            if delay_enabled and delay_ms > 0:
-                delay_frames = int((delay_ms / 1000.0) * self.sample_rate / self.chunk_size)
-                print(f"延迟设置: {delay_frames} 帧 (约 {delay_ms} 毫秒)")
             
             while self.is_running:
                 try:
@@ -519,25 +472,24 @@ class AudioManager:
                     
                     # 检查音频数据是否有效
                     if np.max(np.abs(audio_array)) < 100:  # 如果音量太小，可能是静音
+                        # 即使是静音也要放入播放队列，保持连续性
+                        if monitor_enabled:
+                            try:
+                                # 非阻塞方式放入队列，如果队列满则跳过
+                                self.playback_queue.put(audio_data, block=False)
+                            except queue.Full:
+                                # 队列已满，跳过此帧
+                                pass
                         continue
                     
-                    # 处理延迟音频播放
-                    if monitor_enabled and hasattr(self, 'output_stream'):
+                    # 如果启用了监听，将原始音频数据放入播放队列
+                    if monitor_enabled:
                         try:
-                            if delay_enabled and delay_ms > 0:
-                                # 将当前帧添加到延迟缓冲区
-                                audio_delay_buffer.append(audio_data)
-                                
-                                # 当缓冲区达到延迟帧数时开始播放
-                                if len(audio_delay_buffer) > delay_frames:
-                                    # 获取最早的帧进行播放
-                                    play_data = audio_delay_buffer.pop(0)
-                                    self.output_stream.write(play_data)
-                            else:
-                                # 直接播放，无延迟
-                                self.output_stream.write(audio_data)
-                        except Exception as e:
-                            print(f"播放音频时出错: {str(e)}")
+                            # 非阻塞方式放入队列，如果队列满则跳过
+                            self.playback_queue.put(audio_data, block=False)
+                        except queue.Full:
+                            # 队列已满，跳过此帧
+                            pass
                     
                     # 转换为float32并归一化（用于识别）
                     audio_float = audio_array.astype(np.float32) / 32768.0
@@ -548,44 +500,11 @@ class AudioManager:
                     
                     # 当识别缓冲区达到指定时长时进行处理
                     if recognition_buffer_duration >= record_seconds:
-                        # 记录识别开始时间
-                        rec_start = time.time()
-                        
                         # 合并音频数据
                         recognition_data = np.concatenate(recognition_buffer)
                         
-                        # 使用音频处理器进行识别
-                        result = self.audio_processor.process_audio(recognition_data)
-                        recognized_text = result.get("text", "")
-                        detected_language = result.get("language")
-                        
-                        # 计算本次识别实际耗时
-                        rec_end = time.time()
-                        proc_time = int((rec_end - rec_start) * 1000)
-                        
-                        # 检查是否与上一次识别的文本相同
-                        if recognized_text and recognized_text != last_recognized_text:
-                            # 更新上一次识别的文本
-                            last_recognized_text = recognized_text
-                            
-                            # 将识别结果放入队列
-                            self.result_queue.append(RecognitionResult(
-                                text=recognized_text,
-                                language=detected_language,
-                                delay_ms=proc_time
-                            ))
-                            self.text_queue.append(recognized_text)
-                            
-                            # 添加到字幕管理器
-                            self.subtitle_manager.add_subtitle(recognized_text)
-                            
-                            # 更新识别延迟
-                            self.recognition_delay = proc_time
-                            
-                            # 记录日志
-                            if DEBUG_MODE:
-                                print(f"识别文本: {recognized_text[:50]}... (语言: {detected_language}, 延迟: {proc_time}ms)")
-                            logger.info(f"识别文本: {recognized_text[:50]}... (语言: {detected_language}, 延迟: {proc_time}ms)")
+                        # 将音频数据放入识别队列 - 直接传递NumPy数组，而不是字节
+                        self.audio_queue.put((recognition_data, time.time()))
                         
                         # 清空缓冲区，但保留最后0.2秒的数据，减少延迟
                         overlap_samples = int(0.2 * self.sample_rate)
@@ -602,9 +521,115 @@ class AudioManager:
             import traceback
             traceback.print_exc()
         finally:
-            # 清理资源
-            self._cleanup_pyaudio()
-    
+            # 关闭输入流
+            if hasattr(self, 'stream') and self.stream:
+                try:
+                    if self.stream.is_active():
+                        self.stream.stop_stream()
+                    self.stream.close()
+                    self.stream = None
+                except Exception as e:
+                    print(f"关闭音频输入流时出错: {str(e)}")
+            
+    def _playback_audio(self):
+        """专门的音频播放线程 - 只负责播放音频，与识别完全分离"""
+        try:
+            # 获取延迟设置
+            delay_enabled = config.get("audio_delay_enabled", False)
+            delay_ms = config.get("audio_delay_ms", 0)
+            
+            # 创建输出流
+            try:
+                # 如果PyAudio实例不存在，初始化它
+                if self.pyaudio_instance is None:
+                    self._init_pyaudio()
+                    if self.pyaudio_instance is None:
+                        print("无法创建音频输出流：PyAudio实例初始化失败")
+                        return
+                
+                # 创建输出流
+                output_stream = self.pyaudio_instance.open(
+                    format=pyaudio.paInt16,
+                    channels=self.channels,
+                    rate=self.sample_rate,
+                    output=True,
+                    frames_per_buffer=self.chunk_size,
+                    output_device_index=self.output_device_index if hasattr(self, 'output_device_index') else None
+                )
+                
+                print(f"音频输出流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}")
+            except Exception as e:
+                print(f"创建音频输出流失败: {str(e)}")
+                return
+            
+            # 延迟缓冲区
+            delay_buffer = deque(maxlen=10000)  # 足够大的缓冲区
+            
+            # 如果启用延迟，计算延迟帧数并预填充缓冲区
+            delay_frames = 0
+            if delay_enabled and delay_ms > 0:
+                delay_frames = int((delay_ms / 1000.0) * self.sample_rate / self.chunk_size)
+                print(f"播放线程: 延迟设置为 {delay_frames} 帧 (约 {delay_ms} 毫秒)")
+                
+                # 预填充静音
+                silent_frame = bytes(self.chunk_size * self.channels * 2)  # 16位音频 = 2字节/样本
+                for _ in range(delay_frames):
+                    delay_buffer.append(silent_frame)
+                print(f"播放线程: 已预填充 {delay_frames} 帧静音数据")
+            
+            # 播放循环
+            while self.is_running:
+                try:
+                    # 从队列获取音频数据（最多等待0.1秒）
+                    try:
+                        audio_data = self.playback_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        # 队列为空，播放静音保持连续性
+                        if output_stream.is_active():
+                            silent_frame = bytes(self.chunk_size * self.channels * 2)
+                            if delay_enabled and delay_ms > 0:
+                                # 添加静音帧到延迟缓冲区
+                                delay_buffer.append(silent_frame)
+                                if len(delay_buffer) > 0:
+                                    output_stream.write(delay_buffer.popleft())
+                            else:
+                                output_stream.write(silent_frame)
+                        continue
+                    
+                    # 延迟播放逻辑
+                    if delay_enabled and delay_ms > 0:
+                        # 将新数据添加到延迟缓冲区
+                        delay_buffer.append(audio_data)
+                        # 始终播放最早的帧，保持连续流动
+                        if len(delay_buffer) > 0:
+                            output_stream.write(delay_buffer.popleft())
+                    else:
+                        # 直接播放，无延迟
+                        output_stream.write(audio_data)
+                    
+                    # 标记此任务完成
+                    self.playback_queue.task_done()
+                    
+                except Exception as e:
+                    print(f"播放音频时出错: {str(e)}")
+                    time.sleep(0.01)  # 防止错误循环消耗CPU
+            
+        except Exception as e:
+            print(f"音频播放线程出错: {str(e)}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # 关闭输出流
+            if 'output_stream' in locals() and output_stream:
+                try:
+                    if output_stream.is_active():
+                        output_stream.stop_stream()
+                    output_stream.close()
+                except Exception as e:
+                    print(f"关闭音频输出流时出错: {str(e)}")
+            
+            print("音频播放线程已结束")
+            
     def _recognize_audio(self):
         """使用Whisper模型识别音频"""
         while self.is_running or not self.audio_queue.empty():
@@ -616,8 +641,17 @@ class AudioManager:
                 is_large_model = self.current_model_name == "large"
                 
                 try:
-                    # 将二进制音频数据转换为NumPy数组
-                    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+                    # 直接使用NumPy数组，不需要再次转换
+                    audio_np = audio_data
+                    
+                    # 确保数据类型正确
+                    if audio_np.dtype != np.float32:
+                        audio_np = audio_np.astype(np.float32)
+                    
+                    # 确保音频数据在[-1, 1]范围内
+                    max_abs = np.max(np.abs(audio_np))
+                    if max_abs > 1.0:
+                        audio_np = audio_np / max_abs
                     
                     # 确保数据是一维数组
                     if len(audio_np.shape) > 1:
@@ -631,6 +665,10 @@ class AudioManager:
                             # 复制数据以达到最小长度
                             repeats = int(np.ceil(self.sample_rate / max(1, len(audio_np))))
                             audio_np = np.tile(audio_np, repeats)[:self.sample_rate]
+                    
+                    # 输出音频数据的统计信息（仅在调试模式下）
+                    if DEBUG_MODE:
+                        print(f"准备识别的音频: 形状={audio_np.shape}, 类型={audio_np.dtype}, 最大值={np.max(audio_np)}, 最小值={np.min(audio_np)}")
                     
                     # 开始计时
                     rec_start = time.time()

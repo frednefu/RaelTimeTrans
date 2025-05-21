@@ -1,5 +1,6 @@
 import json
 import os
+import traceback
 
 class Config:
     def __init__(self):
@@ -28,7 +29,7 @@ class Config:
             "audio_delay_ms": 0,  # 音频延迟毫秒数
             "main_window_width": 800,  # 主窗口宽度
             "main_window_height": 600,   # 主窗口高度
-            "show_audio_stats": False,  # 是否显示音频数据统计信息
+            "show_audio_stats": True,  # 是否显示音频数据统计信息 - 修改为默认开启
         }
         self.settings = self.load_settings()
         
@@ -66,7 +67,7 @@ class Config:
             self.save_settings()
 
     def get(self, key, default=None):
-        """获取配置项"""
+        """获取配置项，如果不存在则返回默认值"""
         return self.settings.get(key, default)
 
     def set(self, key, value):
