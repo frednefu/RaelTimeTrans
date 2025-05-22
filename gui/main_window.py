@@ -41,12 +41,16 @@ class MainWindow(QMainWindow):
         
         # 启动定时器定期更新翻译结果
         self.timer = QTimer()
-        self.timer.setInterval(250)  # 增加到250ms
+        self.timer.setInterval(500)  # 增加到500ms，减少UI更新频率
         self.timer.timeout.connect(self.update_subtitles)
         
         # 记录上次更新UI的时间，避免过于频繁的更新
         self.last_update_time = 0
-        self.ui_update_interval = 300  # 300ms最小UI更新间隔
+        self.ui_update_interval = 500  # 500ms最小UI更新间隔，减少UI更新频率
+        
+        # 记录当前显示的文本，避免重复更新相同内容
+        self.current_displayed_text = ""
+        self.current_displayed_translation = ""
         
         # 创建初始化标志，避免重复初始化模型
         self.model_initialized = False
@@ -427,27 +431,61 @@ class MainWindow(QMainWindow):
         self.update_model_status()
         
     def closeEvent(self, event):
-        """程序关闭时的处理"""
-        # 停止录音和翻译
+        """窗口关闭事件处理"""
         try:
-            if self.audio_manager.is_running:
-                self.audio_manager.stop_recording()
+            # 保存所有设置
+            self.save_all_settings()
+            
+            # 停止定时器
+            if hasattr(self, 'timer') and self.timer:
+                self.timer.stop()
+            
+            # 确保录音停止
+            if hasattr(self, 'audio_manager') and self.audio_manager:
+                if hasattr(self.audio_manager, 'is_running') and self.audio_manager.is_running:
+                    print("正在停止录音...")
+                    self.audio_manager.stop_recording()
+                    # 等待音频管理器所有线程结束
+                    time.sleep(0.5)
+                
+                # 清理音频处理器资源
+                if hasattr(self.audio_manager, 'audio_processor'):
+                    if hasattr(self.audio_manager.audio_processor, 'cleanup'):
+                        print("清理音频处理器资源...")
+                        self.audio_manager.audio_processor.cleanup()
+                    
+                    # 确保线程池停止
+                    if hasattr(self.audio_manager.audio_processor, 'thread_pool'):
+                        print("停止Whisper线程池...")
+                        self.audio_manager.audio_processor.thread_pool.stop()
+            
+            # 关闭字幕窗口
+            if hasattr(self, 'subtitle_window') and self.subtitle_window:
+                print("关闭字幕窗口...")
+                self.subtitle_window.close()
+            
+            # 强制清理资源
+            import gc
+            print("执行垃圾回收...")
+            gc.collect()
+            
+            # 如果使用GPU，清理CUDA缓存
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    print("清理CUDA缓存...")
+                    torch.cuda.empty_cache()
+            except:
+                pass
+                
+            print("关闭窗口完成")
+            
+            # 接受关闭事件
+            event.accept()
+            
         except Exception as e:
-            print(f"关闭录音时出错: {str(e)}")
-        
-        # 关闭字幕窗口
-        self.subtitle_window.close()
-        
-        # 清除检测到的语言标签和延迟信息
-        self.detected_language_label.setText("")
-        self.recognition_delay_label.setText("")
-        self.translation_delay_label.setText("")
-        
-        # 确保所有设置都被保存
-        self.save_all_settings()
-        
-        # 调用父类方法关闭窗口
-        super().closeEvent(event)
+            print(f"关闭窗口时出错: {e}")
+            event.accept()  # 无论如何都接受关闭事件
     
     def save_all_settings(self):
         """保存所有当前设置到配置文件"""
@@ -764,23 +802,32 @@ class MainWindow(QMainWindow):
         # 获取最新识别的文本
         text = self.audio_manager.get_latest_text()
         
+        # 调试: 打印从音频管理器获取的文本
+        print(f"从AudioManager获取的最新文本: {text}")
+        
         # 如果没有文本，不进行更新
         if not text:
+            print("没有获取到文本，跳过更新")
             return
             
-        # 记录当前显示的原文，用于比较是否变化
-        current_original = self.original_preview.text()
-        
-        # 如果原文没有变化，只更新延迟信息，不进行完整UI更新
-        if text == current_original:
+        # 检查文本是否与当前显示的相同，避免重复更新
+        if text == self.current_displayed_text:
+            # 只更新延迟信息，不进行完整UI更新
+            print(f"文本未变化，跳过更新: '{text[:30]}...'")
             self.update_delay_info()
             return
             
         # 更新最后一次UI更新时间戳
         self.last_update_time = current_time
+        # 保存当前显示的文本
+        self.current_displayed_text = text
+        
+        print(f"准备更新UI，新文本: '{text[:30]}...'")
             
-        # 更新原文预览
-        self.original_preview.setText(text)
+        # 更新原文预览，只有当确实需要显示时才更新
+        if self.original_preview.isVisible():
+            self.original_preview.setText(text)
+            print("已更新原文预览")
         
         # 获取当前字幕模式
         subtitle_mode = config.get("subtitle_mode", "translated")
@@ -795,18 +842,36 @@ class MainWindow(QMainWindow):
         
         if is_translation_disabled:
             # 不翻译模式：直接使用原文，清空译文
-            self.subtitle_preview.setText("")
+            print("不翻译模式，直接使用原文")
+            if self.subtitle_preview.isVisible():
+                self.subtitle_preview.setText("")
             original_text_for_subtitle = text
         else:
             try:
                 # 翻译文本
+                print(f"开始翻译文本到 {target_language}")
                 translation = self.subtitle_manager.translate(text, target_language)
+                print(f"翻译结果: '{translation[:30]}...'")
+                
+                # 检查翻译是否与当前显示的相同
+                if translation == self.current_displayed_translation:
+                    # 翻译没有变化，只更新原文和延迟信息
+                    print("翻译结果未变化，只更新原文")
+                    if subtitle_mode == "both" and self.original_preview.isVisible():
+                        self.original_preview.setText(text)
+                    self.update_delay_info()
+                    return
+                    
+                # 保存当前显示的翻译
+                self.current_displayed_translation = translation
                 
                 # 将译文保存到音频管理器的字幕管理器中
                 self.audio_manager.add_translated_text(text, translation)
                 
-                # 更新译文预览
-                self.subtitle_preview.setText(translation)
+                # 更新译文预览，只有当需要显示时才更新
+                if self.subtitle_preview.isVisible():
+                    self.subtitle_preview.setText(translation)
+                    print("已更新译文预览")
                 
                 # 根据当前字幕模式准备字幕文本
                 if subtitle_mode == "translated":
@@ -817,21 +882,22 @@ class MainWindow(QMainWindow):
                     original_text_for_subtitle = text
                     translation_text_for_subtitle = translation
                 
+                print(f"字幕模式: {subtitle_mode}, 原文: '{original_text_for_subtitle[:20]}...', 译文: '{translation_text_for_subtitle[:20]}...'")
+                
             except Exception as e:
-                if DEBUG_MODE:
-                    print(f"翻译错误: {e}")
+                print(f"翻译错误: {e}")
                 # 翻译出错时使用原文
                 original_text_for_subtitle = text
         
         # 只在需要时更新字幕窗口，并且只更新一次
-        self.subtitle_window.update_text(
-            original_text=original_text_for_subtitle,
-            translation_text=translation_text_for_subtitle
-        )
-        
-        # 确保字幕窗口可见
-        if not self.subtitle_window.isVisible():
-            self.subtitle_window.show()
+        if self.subtitle_window.isVisible():
+            print("更新字幕窗口内容")
+            self.subtitle_window.update_text(
+                original_text=original_text_for_subtitle,
+                translation_text=translation_text_for_subtitle
+            )
+        else:
+            print("字幕窗口不可见，跳过更新")
         
         # 更新语言识别标签
         self.update_detected_language_label()
@@ -858,27 +924,35 @@ class MainWindow(QMainWindow):
         """更新延迟信息标签"""
         # 获取识别延迟
         recognition_delay = self.audio_manager.get_recognition_delay()
+        recognition_text = ""
+        
         if recognition_delay > 0:
             # 格式化显示，保持统一格式
             if recognition_delay < 10000:  # 小于10秒
-                self.recognition_delay_label.setText(f"[延迟: {recognition_delay}ms]")
+                recognition_text = f"[延迟: {recognition_delay}ms]"
             else:  # 大于等于10秒，显示为秒
                 seconds = recognition_delay / 1000.0
-                self.recognition_delay_label.setText(f"[延迟: {seconds:.1f}s]")
-        else:
-            self.recognition_delay_label.setText("")
+                recognition_text = f"[延迟: {seconds:.1f}s]"
+        
+        # 只有当文本实际变化时才更新UI
+        if recognition_text != self.recognition_delay_label.text():
+            self.recognition_delay_label.setText(recognition_text)
         
         # 获取翻译延迟
         translation_delay = self.subtitle_manager.get_translation_delay()
+        translation_text = ""
+        
         if translation_delay > 0:
             # 格式化显示，保持统一格式
             if translation_delay < 10000:  # 小于10秒
-                self.translation_delay_label.setText(f"[延迟: {translation_delay}ms]")
+                translation_text = f"[延迟: {translation_delay}ms]"
             else:  # 大于等于10秒，显示为秒
                 seconds = translation_delay / 1000.0
-                self.translation_delay_label.setText(f"[延迟: {seconds:.1f}s]")
-        else:
-            self.translation_delay_label.setText("")
+                translation_text = f"[延迟: {seconds:.1f}s]"
+                
+        # 只有当文本实际变化时才更新UI
+        if translation_text != self.translation_delay_label.text():
+            self.translation_delay_label.setText(translation_text)
     
     def apply_saved_settings(self):
         """应用保存的设置"""
@@ -1439,7 +1513,6 @@ class MainWindow(QMainWindow):
                 self.model_status_label.setStyleSheet("color: red;")
                 QApplication.processEvents()
             except:
-                pass 
                 pass 
 
     def on_show_audio_stats_changed(self, state):
