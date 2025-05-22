@@ -12,7 +12,7 @@
     "subtitle_mode": "both",
     "input_device": "CABLE Output (VB-Audio Virtual  (Index: 1)",
     "output_device": "扬声器 (Realtek High Definition Au (Index: 3)",
-    "monitor_enabled": true,
+    "monitor_enabled": false,
     "main_window_width": 800,
     "main_window_height": 818,
     "audio_delay_enabled": true,

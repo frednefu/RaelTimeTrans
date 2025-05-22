@@ -122,29 +122,33 @@ class SubtitleManager:
                 print(f"术语替换表: {replacements}")
             
             # 步骤5: 翻译非术语部分
-            # 先翻译整个文本
-            translated_text = self.translator.translate(preprocessed_text, dest=target_code).text
-            if debug:
-                print(f"步骤5 - 基础翻译: {translated_text}")
+            try:
+                translated_text = self.translator.translate(preprocessed_text, dest=target_code).text
+                if debug:
+                    print(f"步骤5 - 基础翻译: {translated_text}")
+            except Exception as e:
+                if debug:
+                    print(f"谷歌翻译API出错: {str(e)}")
+                # 如果翻译失败，返回处理后的文本
+                return processed_text
             
             # 步骤6: 还原术语占位符
-            final_text = self.term_manager.restore_ham_radio_terms(translated_text, replacements)
-            if debug:
-                print(f"步骤6 - 术语还原: {final_text}")
-            
-            # 步骤7: 再次翻译，确保所有内容都被翻译
-            if target_code == "zh-cn":
-                # 提取所有英文单词
-                english_words = re.findall(r'\b[a-zA-Z]+\b', final_text)
-                if english_words:
-                    # 翻译剩余的英文内容
-                    remaining_text = " ".join(english_words)
-                    translated_remaining = self.translator.translate(remaining_text, dest=target_code).text
-                    
-                    # 替换英文单词为翻译后的内容
-                    for word in english_words:
-                        if word.lower() in translated_remaining.lower():
-                            final_text = final_text.replace(word, translated_remaining)
+            try:
+                final_text = self.term_manager.restore_ham_radio_terms(translated_text, replacements)
+                
+                # 检查是否还有未替换的占位符
+                if '__TERM_' in final_text or '__term_' in final_text:
+                    # 如果还有未替换的占位符，尝试再次执行替换
+                    final_text = self.term_manager.restore_ham_radio_terms(final_text, replacements)
+                
+                if debug:
+                    print(f"步骤6 - 术语还原: {final_text}")
+            except Exception as e:
+                if debug:
+                    print(f"术语还原出错: {str(e)}")
+                    traceback.print_exc()
+                # 如果还原失败，返回翻译后的文本
+                final_text = translated_text
             
             # 计算翻译延迟
             end_time = time.time()
@@ -155,10 +159,16 @@ class SubtitleManager:
         except Exception as e:
             if debug:
                 print(f"翻译过程出错: {str(e)}")
-                import traceback
                 traceback.print_exc()
-            # 发生错误时返回原文
-            return text
+            # 发生错误时返回原文或经过处理的文本
+            # 优先返回经过呼号处理的文本，这样至少保留了基本处理
+            try:
+                if 'processed_text' in locals():
+                    return processed_text
+                else:
+                    return text
+            except:
+                return text
     
     def _restore_case(self, translated_text, original_patterns):
         """

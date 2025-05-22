@@ -28,10 +28,11 @@ class TermManager:
             os.makedirs(self.resource_dir)
             print(f"创建术语资源目录: {self.resource_dir}")
     
-    def load_terms(self):
+    def load_terms(self, verbose=False):
         """从JSON文件加载术语定义"""
         if not os.path.exists(self.term_file):
-            print(f"术语定义文件 {self.term_file} 不存在，将创建默认术语")
+            if verbose:
+                print(f"术语定义文件 {self.term_file} 不存在，将创建默认术语")
             self._create_default_terms()
             return
         
@@ -52,7 +53,7 @@ class TermManager:
                     invalid_terms.append(term)
             
             # 如果有无效术语，更新术语词典并保存
-            if invalid_terms:
+            if invalid_terms and verbose:
                 print(f"警告: 忽略了 {len(invalid_terms)} 个无效术语: {', '.join(invalid_terms)}")
                 self.terms = valid_terms
                 self.save_terms()
@@ -66,26 +67,29 @@ class TermManager:
                 pattern = r'\b' + re.escape(term) + r'\b'
                 self.patterns[term] = re.compile(pattern, re.IGNORECASE)
             
-            term_count = len(self.terms)    
-            print(f"从 {self.term_file} 加载了 {term_count} 个业余无线电术语")
+            if verbose:
+                term_count = len(self.terms)    
+                print(f"从 {self.term_file} 加载了 {term_count} 个业余无线电术语")
             
             # 检查是否包含关键术语
             key_terms = ['CQ', 'Roger', 'QRZ', '73']
             missing_terms = [term for term in key_terms if term not in self.terms]
-            if missing_terms:
+            if missing_terms and verbose:
                 print(f"警告: 术语文件缺少以下关键术语: {', '.join(missing_terms)}")
                 print(f"建议编辑 {self.term_file} 添加这些术语")
                 
         except json.JSONDecodeError as e:
-            print(f"术语文件 {self.term_file} 格式无效: {str(e)}")
-            print(f"将创建新的默认术语文件")
+            if verbose:
+                print(f"术语文件 {self.term_file} 格式无效: {str(e)}")
+                print(f"将创建新的默认术语文件")
             self._create_default_terms()
         except Exception as e:
-            print(f"加载术语文件时出错: {str(e)}")
-            print(f"将使用默认术语")
+            if verbose:
+                print(f"加载术语文件时出错: {str(e)}")
+                print(f"将使用默认术语")
             self._create_default_terms()
     
-    def _create_default_terms(self):
+    def _create_default_terms(self, verbose=False):
         """创建默认的术语定义文件"""
         # 仅包含几个基本术语的最小集合，仅在JSON文件不存在时使用
         default_terms = {
@@ -123,10 +127,12 @@ class TermManager:
                 pattern = r'\b' + re.escape(term) + r'\b'
                 self.patterns[term] = re.compile(pattern, re.IGNORECASE)
                 
-            print(f"创建了默认术语定义文件: {self.term_file}")
-            print(f"注意: 这只是基本术语。请根据需要编辑 {self.term_file} 添加更多术语。")
+            if verbose:
+                print(f"创建了默认术语定义文件: {self.term_file}")
+                print(f"注意: 这只是基本术语。请根据需要编辑 {self.term_file} 添加更多术语。")
         except Exception as e:
-            print(f"创建默认术语文件时出错: {str(e)}")
+            if verbose:
+                print(f"创建默认术语文件时出错: {str(e)}")
     
     def extract_and_convert_signal_report(self, text):
         """
@@ -174,8 +180,64 @@ class TermManager:
         
         return ' '.join(result)
 
+    def preprocess_phonetic_callsign(self, text):
+        """
+        预处理字母解释法呼号，特别处理带有逗号和额外空格的情况
+        
+        参数:
+            text (str): 原始文本
+            
+        返回:
+            str: 预处理后的文本
+        """
+        if not text:
+            return text
+            
+        # 定义字母解释法映射，仅用于检测
+        phonetic_words = [
+            'alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel',
+            'india', 'juliet', 'kilo', 'lima', 'mike', 'november', 'oscar', 'papa',
+            'quebec', 'romeo', 'sierra', 'tango', 'uniform', 'victor', 'whiskey', 
+            'x-ray', 'xray', 'yankee', 'zulu'
+        ]
+        
+        result = text
+        
+        # 正则表达式：匹配连续的字母解释法单词（可能有逗号分隔）
+        # 例如: "Victor, Echo, 5, Alpha, Echo" 或 "Alpha Bravo"
+        phonetic_pattern = r'(?:' + '|'.join(phonetic_words) + r')(?:,?\s+(?:' + '|'.join(phonetic_words) + r'|\d+))+' 
+        
+        # 查找所有可能的呼号段
+        matches = re.finditer(phonetic_pattern, text, re.IGNORECASE)
+        
+        for match in matches:
+            callsign_segment = match.group(0)
+            # 去掉逗号，保持空格
+            cleaned_segment = re.sub(r',\s*', ' ', callsign_segment)
+            result = result.replace(callsign_segment, cleaned_segment)
+        
+        # 检测并清理类似于 "Alpha, Bravo" 的模式（只有一个逗号）
+        comma_pattern = r'(?:' + '|'.join(phonetic_words) + r'),\s+(?:' + '|'.join(phonetic_words) + r')'
+        comma_matches = re.finditer(comma_pattern, result, re.IGNORECASE)
+        
+        for match in comma_matches:
+            comma_segment = match.group(0)
+            # 去掉逗号，保持空格
+            cleaned_segment = re.sub(r',\s*', ' ', comma_segment)
+            result = result.replace(comma_segment, cleaned_segment)
+        
+        return result
+
     def extract_and_convert_phonetic_callsign(self, text):
-        """提取并转换字母解释法呼号"""
+        """
+        提取并转换字母解释法呼号，仅在连续出现两个或以上的字母解释法单词时才进行转换
+        
+        参数:
+            text (str): 输入文本
+            
+        返回:
+            str: 处理后的文本
+        """
         if not text:
             return text
             
@@ -187,34 +249,51 @@ class TermManager:
             'mike': 'M', 'november': 'N', 'oscar': 'O', 'papa': 'P',
             'quebec': 'Q', 'romeo': 'R', 'sierra': 'S', 'tango': 'T',
             'uniform': 'U', 'victor': 'V', 'whiskey': 'W', 'x-ray': 'X',
-            'yankee': 'Y', 'zulu': 'Z'
+            'yankee': 'Y', 'zulu': 'Z',
+            # 添加数字词映射
+            'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+            'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9'
         }
         
+        # 预处理：处理带有逗号和额外空格的字母解释法词
+        processed_text = self.preprocess_phonetic_callsign(text)
+        
         # 将文本分割成单词
-        words = text.split()
+        words = processed_text.split()
         result = []
         i = 0
         
+        # 简化版本：只处理连续的字母解释法单词
         while i < len(words):
             word = words[i].lower()
             
             # 检查是否是字母解释法单词
             if word in phonetic_map:
-                # 收集连续的字母解释法单词
-                callsign_parts = []
-                while i < len(words) and words[i].lower() in phonetic_map:
-                    callsign_parts.append(phonetic_map[words[i].lower()])
-                    i += 1
+                # 查找连续的字母解释法单词
+                j = i + 1
+                consecutive_count = 1
+                callsign_parts = [phonetic_map[word]]
                 
-                # 如果收集到了字母解释法单词，组合成呼号
-                if callsign_parts:
-                    callsign = ''.join(callsign_parts)
+                while j < len(words) and words[j].lower() in phonetic_map:
+                    callsign_parts.append(phonetic_map[words[j].lower()])
+                    consecutive_count += 1
+                    j += 1
+                
+                # 仅当连续出现两个或以上的字母解释法单词时才转换
+                if consecutive_count >= 2:
+                    # 组合成呼号并添加到结果中
+                    callsign = ''.join(callsign_parts).upper()  # 确保呼号为大写
                     result.append(callsign)
+                    i = j  # 跳过已处理的单词
+                else:
+                    # 单独的字母解释法单词保持原样
+                    result.append(words[i])
+                    i += 1
                 continue
             
-            # 检查是否是标准呼号格式
-            if re.match(r'^[A-Z0-9]{3,}[A-Z][0-9][A-Z]{1,3}$', words[i]):
-                result.append(words[i])
+            # 检查是否是标准呼号格式(使其大写)
+            if re.match(r'^[A-Z0-9]{2,}[0-9][A-Z]{1,3}$', words[i], re.IGNORECASE):
+                result.append(words[i].upper())
                 i += 1
                 continue
             
@@ -347,20 +426,25 @@ class TermManager:
             self.sorted_terms = sorted(self.terms.keys(), key=len, reverse=True)
             self.save_terms()
     
-    def save_terms(self):
+    def save_terms(self, verbose=False):
         """保存术语到JSON文件"""
         try:
             with open(self.term_file, 'w', encoding='utf-8') as f:
                 json.dump(self.terms, f, ensure_ascii=False, indent=4)
-            print(f"保存术语定义到: {self.term_file}")
+            if verbose:
+                print(f"保存术语定义到: {self.term_file}")
         except Exception as e:
-            print(f"保存术语文件时出错: {str(e)}")
+            if verbose:
+                print(f"保存术语文件时出错: {str(e)}")
 
     def convert_phonetic_callsign(self, text):
         """
-        将字母解释法呼号转换为标准呼号。
-        例如：'Bravo Golf two alpha yankee kilo' -> 'BG2AYK'
+        将字母解释法呼号转换为标准呼号，仅在连续出现两个或以上的字母解释法单词时才进行转换。
+        例如：'Bravo Golf two alpha yankee kilo' -> 'BG2AYK'，但单独的'Golf'或'Alpha'保持不变
         """
+        if not text:
+            return text
+            
         phonetic_map = {
             'alpha': 'A', 'bravo': 'B', 'charlie': 'C', 'delta': 'D', 'echo': 'E',
             'foxtrot': 'F', 'golf': 'G', 'hotel': 'H', 'india': 'I', 'juliet': 'J',
@@ -370,15 +454,43 @@ class TermManager:
             'zulu': 'Z', 'zero': '0', 'one': '1', 'two': '2', 'three': '3',
             'four': '4', 'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9'
         }
-        import re
+        
+        # 将文本分割成单词
         words = text.lower().split()
         result = []
-        for word in words:
+        i = 0
+        
+        # 简化版本：只处理连续的字母解释法单词，避免可能的无限循环
+        while i < len(words):
+            word = words[i]
+            
+            # 检查当前单词是否是字母解释法
             if word in phonetic_map:
-                result.append(phonetic_map[word])
+                # 寻找连续的字母解释法单词
+                j = i + 1
+                consecutive_count = 1
+                phonetic_sequence = [phonetic_map[word]]
+                
+                while j < len(words) and words[j] in phonetic_map:
+                    phonetic_sequence.append(phonetic_map[words[j]])
+                    consecutive_count += 1
+                    j += 1
+                
+                # 仅当连续出现两个或以上的字母解释法单词时才转换
+                if consecutive_count >= 2:
+                    callsign = ''.join(phonetic_sequence).upper()
+                    result.append(callsign)
+                    i = j  # 跳过已处理的单词
+                else:
+                    # 单独的字母解释法单词保持原样
+                    result.append(word)
+                    i += 1
             else:
+                # 其他单词直接添加
                 result.append(word)
-        return ''.join(result)
+                i += 1
+        
+        return ' '.join(result)
 
     def direct_translate(self, text, target_language):
         """直接翻译特殊术语"""
@@ -439,10 +551,61 @@ class TermManager:
         # 按占位符长度降序排序，避免部分替换问题
         sorted_placeholders = sorted(replacements.keys(), key=len, reverse=True)
         
-        # 还原每个术语
-        for placeholder in sorted_placeholders:
-            if placeholder in result:
-                result = result.replace(placeholder, replacements[placeholder])
+        # 设置最大迭代次数，避免可能的无限循环
+        max_iterations = 3
+        iterations = 0
+        
+        # 迭代处理，直到所有占位符都被替换完毕或达到最大迭代次数
+        while iterations < max_iterations:
+            iterations += 1
+            replaced = False
+            
+            # 先处理精确匹配的占位符
+            for placeholder in sorted_placeholders:
+                replacement = replacements[placeholder]
+                original_result = result
+                
+                # 使用正则表达式进行精确匹配替换，确保只替换完整的占位符
+                pattern = re.compile(re.escape(placeholder), re.IGNORECASE)
+                result = pattern.sub(replacement, result)
+                
+                if result != original_result:
+                    replaced = True
+            
+            # 处理带变形的占位符
+            for placeholder in sorted_placeholders:
+                replacement = replacements[placeholder]
+                placeholder_id = placeholder.replace("__TERM_", "").replace("__", "")
+                
+                # 处理各种变形格式
+                patterns = [
+                    # 处理带空格的占位符形式 (__TERM_0__)
+                    r'__\s*TERM_' + re.escape(placeholder_id) + r'\s*__',
+                    # 处理小写的变形 (__term_0__)
+                    r'__\s*term_' + re.escape(placeholder_id) + r'\s*__',
+                    # 处理带下划线的变形格式 (__TERM_0_)
+                    r'__\s*TERM_' + re.escape(placeholder_id) + r'_',
+                ]
+                
+                for pattern_str in patterns:
+                    original_result = result
+                    pattern = re.compile(pattern_str, re.IGNORECASE)
+                    
+                    # 如果是带下划线的格式，需要特殊处理
+                    if pattern_str.endswith('_'):
+                        matches = pattern.finditer(result)
+                        for match in matches:
+                            # 替换并保留下划线
+                            result = result[:match.start()] + replacement + '_' + result[match.end():]
+                    else:
+                        result = pattern.sub(replacement, result)
+                    
+                    if result != original_result:
+                        replaced = True
+            
+            # 如果本次迭代没有进行任何替换，说明所有占位符已经替换完毕，退出循环
+            if not replaced:
+                break
         
         return result
 
