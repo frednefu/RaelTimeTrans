@@ -148,3 +148,71 @@ git push -u origin master
    - 撤销工作区修改：`git checkout -- 文件名`
    - 撤销暂存区修改：`git reset HEAD 文件名`
    - 撤销最近一次提交：`git reset --soft HEAD^` 
+
+## 处理大文件和 GitHub 上传
+
+### GitHub 文件大小限制
+
+GitHub 对单个文件的大小限制为 100MB。如果遇到大文件上传问题，请按以下步骤处理：
+
+1. **检查大文件**
+```bash
+# 查看仓库中最大的文件
+git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | sort -k3nr | head -n 10
+```
+
+2. **从 Git 历史中删除大文件**
+```bash
+# 从 Git 历史中删除指定文件
+git filter-branch --force --index-filter "git rm --cached --ignore-unmatch 文件路径" --prune-empty --tag-name-filter cat -- --all
+```
+
+3. **强制推送更新后的历史**
+```bash
+git push origin main --force
+```
+
+### 处理大文件的最佳实践
+
+1. **使用 .gitignore**
+   - 在 `.gitignore` 文件中添加大文件目录
+   - 例如：`ffmpeg_temp/` 目录已被配置为忽略
+
+2. **替代方案**
+   - 将大文件存储在外部存储服务中
+   - 在安装脚本中自动下载所需的大文件
+   - 使用 Git LFS（Large File Storage）管理大文件
+
+3. **项目配置**
+   - 确保 `.gitignore` 文件包含所有需要忽略的大文件
+   - 在 README 中说明如何获取和安装大文件
+   - 提供自动下载脚本
+
+### 常见错误及解决方案
+
+1. **错误：文件超过 GitHub 大小限制**
+```
+remote: error: File xxx is 127.43 MB; this exceeds GitHub's file size limit of 100.00 MB
+```
+解决方案：
+- 从 Git 历史中删除该文件
+- 使用上述 `git filter-branch` 命令清理历史
+- 强制推送更新后的历史
+
+2. **错误：推送被拒绝**
+```
+! [remote rejected] main -> main (pre-receive hook declined)
+```
+解决方案：
+- 检查是否有大文件
+- 清理 Git 历史
+- 使用 `--force` 选项推送
+
+3. **错误：无法删除文件**
+```
+fatal: pathspec 'xxx' did not match any files
+```
+解决方案：
+- 确认文件路径是否正确
+- 使用 `git ls-files` 查看所有被跟踪的文件
+- 确保文件确实存在于 Git 历史中 
