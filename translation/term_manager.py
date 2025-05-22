@@ -583,29 +583,36 @@ class TermManager:
                     r'__\s*TERM_' + re.escape(placeholder_id) + r'\s*__',
                     # 处理小写的变形 (__term_0__)
                     r'__\s*term_' + re.escape(placeholder_id) + r'\s*__',
-                    # 处理带下划线的变形格式 (__TERM_0_)
-                    r'__\s*TERM_' + re.escape(placeholder_id) + r'_',
                 ]
                 
                 for pattern_str in patterns:
                     original_result = result
                     pattern = re.compile(pattern_str, re.IGNORECASE)
-                    
-                    # 如果是带下划线的格式，需要特殊处理
-                    if pattern_str.endswith('_'):
-                        matches = pattern.finditer(result)
-                        for match in matches:
-                            # 替换并保留下划线
-                            result = result[:match.start()] + replacement + '_' + result[match.end():]
-                    else:
-                        result = pattern.sub(replacement, result)
+                    result = pattern.sub(replacement, result)
                     
                     if result != original_result:
                         replaced = True
+                
+                # 单独处理带下划线结尾的变形格式 (__TERM_0_)
+                pattern_str = r'__\s*(?:TERM|term)_' + re.escape(placeholder_id) + r'_'
+                pattern = re.compile(pattern_str, re.IGNORECASE)
+                
+                # 查找所有匹配
+                matches = list(pattern.finditer(result))
+                if matches:
+                    replaced = True
+                    # 从后向前替换，避免位置偏移
+                    for match in reversed(matches):
+                        begin, end = match.span()
+                        # 直接替换，不加下划线
+                        result = result[:begin] + replacement + result[end:]
             
             # 如果本次迭代没有进行任何替换，说明所有占位符已经替换完毕，退出循环
             if not replaced:
                 break
+        
+        # 最终清理：移除可能产生的多余下划线 (如：QRZ（谁在呼叫我）_？)
+        result = re.sub(r'(\S)_([?？,.，。!！])', r'\1\2', result)
         
         return result
 
