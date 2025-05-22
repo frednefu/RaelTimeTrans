@@ -25,56 +25,19 @@
 
 ## 安装步骤
 
-### 方法一：使用Conda环境（推荐）
+1. 克隆或下载本仓库
+2. 运行 `install.bat` 安装程序
+   - 脚本会自动创建并配置所需环境
+   - 安装所有必要的依赖
+   - 下载所需的模型文件
+   - 配置系统环境
 
-1. 确保已安装Conda（可以使用[Miniconda](https://docs.conda.io/en/latest/miniconda.html)或Anaconda）
-2. 克隆或下载本仓库
-3. 使用以下交互式批处理脚本来管理环境和运行程序：
-
-   - **FixDependencies.bat** - 交互式环境创建与管理工具
-     - 可以创建或删除conda环境
-     - 支持从requirements.txt安装依赖
-     - 提供用户交互选项
-
-   - **RunApp.bat** - 启动脚本
-     - 检查环境是否存在，不存在时可选择创建
-     - 自动激活环境并运行程序
-     - 提供错误处理与调试选项
-
-   - **ExportEnv.bat** - 环境导出工具
-     - 支持导出为environment.yml或requirements.txt
-     - 可以选择仅导出conda环境或pip依赖
-     - 导出结果可用于在其他机器上重建环境
-
-> **注意**：所有批处理脚本使用英文界面，以避免在Windows命令行中可能出现的中文乱码问题。
-
-### 方法二：手动安装
-
-1. 克隆或下载本仓库：
-   ```
-   git clone [仓库URL]
-   cd 实时翻译软件
-   ```
-
-2. 安装必要的依赖：
-   ```
-   pip install -r requirements.txt
-   ```
-   
-   注意：如果安装PyAudio时遇到问题，可以尝试：
-   - 从[非官方的Python扩展包](https://www.lfd.uci.edu/~gohlke/pythonlibs/#pyaudio)下载对应版本的wheel文件手动安装
-
-3. 首次运行时，程序会自动下载Whisper模型（约1GB），请确保网络连接畅通。
+> **注意**：首次运行时，程序会自动下载Whisper模型（约1GB），请确保网络连接畅通。
 
 ## 使用方法
 
 1. 启动程序：
-   - 使用Conda环境（推荐）：
-     - 双击 `RunApp.bat`
-   - 手动启动：
-     ```
-     python main.py
-     ```
+   - 双击 `start.bat` 启动程序
 
 2. 在界面中选择：
    - 音频输入设备（例如麦克风）
