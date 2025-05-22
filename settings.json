@@ -15,7 +15,7 @@
     "monitor_enabled": true,
     "main_window_width": 800,
     "main_window_height": 782,
-    "audio_delay_enabled": false,
+    "audio_delay_enabled": true,
     "audio_delay_ms": 3388,
     "original_font_color": "#55ffff",
     "original_font_size": 14,
