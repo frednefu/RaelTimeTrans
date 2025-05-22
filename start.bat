@@ -88,6 +88,6 @@ goto end
 :end
 echo.
 echo 程序已退出。
-pause
+
 
 endlocal 

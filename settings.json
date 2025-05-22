@@ -12,7 +12,7 @@
     "subtitle_mode": "both",
     "input_device": "CABLE Output (VB-Audio Virtual  (Index: 1)",
     "output_device": "DELL S2721DGF (NVIDIA High Defi (Index: 5)",
-    "monitor_enabled": false,
+    "monitor_enabled": true,
     "main_window_width": 800,
     "main_window_height": 782,
     "audio_delay_enabled": false,
