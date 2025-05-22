@@ -2,6 +2,10 @@
 
 这是一个使用Whisper的即时翻译软件，支持通过音频（捕获电脑到音频的输入或输出设备），直接实时地判断原语言，并翻译成目标语言，通过字幕显示在屏幕上。可以设置和预览字幕的颜色、位置、大小等样式。
 
+![alt text](screenshot/screenshot01.png)
+
+![alt text](screenshot/screenshot02.jpg)
+
 ## 功能特点
 
 - 实时捕获系统声音或麦克风输入
