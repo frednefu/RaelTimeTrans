@@ -1,5 +1,5 @@
 {
-    "whisper_model": "tiny",
+    "whisper_model": "small",
     "font_size": 19,
     "font_color": "#ffff00",
     "position": "bottom",
@@ -8,19 +8,19 @@
     "source_language": "auto",
     "target_language": "zh",
     "window_width": 1000,
-    "window_height": 80,
+    "window_height": 131,
     "subtitle_mode": "both",
     "input_device": "CABLE Output (VB-Audio Virtual (Index: 2)",
     "output_device": "耳机 (AirPods Pro) (Index: 10)",
     "monitor_enabled": true,
     "main_window_width": 800,
     "main_window_height": 774,
-    "audio_delay_enabled": true,
-    "audio_delay_ms": 156,
     "original_font_color": "#55ffff",
     "original_font_size": 14,
     "translation_font_size": 19,
     "show_audio_stats": false,
     "original_font_family": "Arial",
-    "translation_font_family": "黑体"
+    "translation_font_family": "黑体",
+    "word_by_word_enabled": true,
+    "partial_interval_ms": 1000
 }

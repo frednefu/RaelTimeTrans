@@ -13,6 +13,7 @@ import logging
 from translation.subtitle_file_manager import SubtitleFileManager
 import torch
 from audio.audio_processor import AudioProcessor
+from audio.audio_timeline import TimedWord, WordSegment, AudioSegmentTask
 from config import config  # 添加 config 导入
 
 # 添加UI线程分离的队列
@@ -39,11 +40,17 @@ logger.addHandler(file_handler)
 # 用于存储识别结果和时间信息的数据结构
 RecognitionResult = namedtuple('RecognitionResult', ['text', 'language', 'delay_ms'])
 
-# 添加语音活动检测相关常量
-SILENCE_THRESHOLD = 0.01  # 静音阈值
-MIN_SILENCE_DURATION = 0.5  # 最小静音持续时间（秒）
-MAX_SEGMENT_DURATION = 10.0  # 最大分段持续时间（秒）
-MIN_SEGMENT_DURATION = 0.5  # 最小分段持续时间（秒）
+# 逐词字幕的时间轴：TimedWord / WordSegment / AudioSegmentTask 定义在
+# audio_timeline 里（时间一律用"采集块号"，1 块 ≈ 64ms），见该模块的说明。
+
+# 监听时，输出设备自身还有一小段缓冲（PortAudio + 驱动），用户实际上比
+# playback_queue 的消费位置再晚听到这么多块。64ms 一块，取 2 块（约 128ms）——
+# 这个量级对字幕对齐已经足够，不必去精确测量设备缓冲。
+_OUTPUT_BUFFER_CHUNKS = 2
+
+# 播放位置最多落后采集这么多块（约 2 秒）。播放线程卡死时 playback_queue 会一直
+# 堆积，不设上限的话字幕会被甩到几秒之后。
+_MAX_LAG_CHUNKS = 32
 
 # WDM-KS 会把未解析的资源串原样吐出来：
 #   "耳机 (@System32\drivers\bthhfenum.sys,#2;%1 Hands-Free%0\r\n;(AirPods Pro))"
@@ -188,12 +195,16 @@ class AudioManager:
         
         # 字幕文件管理器
         self.subtitle_manager = SubtitleFileManager()
-        
-        # 音频延迟缓冲区
-        self.audio_delay_enabled = False
-        self.audio_delay_ms = 0
-        self.audio_buffer = deque()
-        
+
+        # 采集时钟：本轮录音读到的音频块数（1 块 ≈ 64ms）。逐词字幕的所有时间
+        # 换算都以它为准，start_recording 时归零。
+        self.captured_chunks = 0
+        # 逐词片段队列：识别结果里的词级时间轴，界面按播放进度取用
+        self.word_queue = deque(maxlen=16)
+        # 预览识别是否正在跑（同一时刻只允许一个，绝不排队）
+        self._partial_inflight = False
+
+
         # 从配置文件读取模型设置
         self.current_model_name = config.get("whisper_model", "base")
         
@@ -203,12 +214,6 @@ class AudioManager:
         # 添加UI更新标志和时间控制
         self.last_ui_update_time = time.time()
         self.ui_update_interval = 0.1  # 100ms更新一次UI
-        
-        # 添加语音活动检测相关变量
-        self.current_segment = []
-        self.last_voice_time = time.time()
-        self.is_speaking = False
-        self.silence_start = None
 
         # 输入音量监听（用于界面音量表）
         self.input_volume = 0.0
@@ -271,10 +276,6 @@ class AudioManager:
                     print(f"关闭输出流时出错: {str(e)}")
                 finally:
                     self.output_stream = None
-            
-            # 清理缓冲区
-            if hasattr(self, 'audio_buffer'):
-                self.audio_buffer.clear()
             
             # 最后终止 PyAudio 实例
             if self.pyaudio_instance:
@@ -482,11 +483,12 @@ class AudioManager:
         
         # 重置时间统计
         self.recognition_delay = 0
-        
-        # 从配置中读取延迟设置
-        self.audio_delay_enabled = config.get("audio_delay_enabled", False)
-        self.audio_delay_ms = config.get("audio_delay_ms", 0) if self.audio_delay_enabled else 0
-        
+
+        # 重置逐词字幕的时间轴与待显示队列
+        self.captured_chunks = 0
+        self.word_queue.clear()
+        self._partial_inflight = False
+
         # 提取设备索引（按名字重新匹配，不信任标签里的旧索引）
         try:
             self.input_device_index = self.resolve_device_index(input_device, want_input=True)
@@ -523,8 +525,6 @@ class AudioManager:
             self.set_monitor_enabled(True)
 
         print(f"开始录音 - 输入设备: {input_device}, 输出设备: {output_device}")
-        if self.audio_delay_enabled:
-            print(f"音频延迟已启用: {self.audio_delay_ms} 毫秒")
 
     def set_monitor_enabled(self, enabled):
         """开关"监听系统声音"（把采集到的音频送到输出设备）
@@ -743,12 +743,14 @@ class AudioManager:
     def _record_audio(self):
         """录制音频 - 只负责采集音频并送入队列"""
         try:
-            # 获取当前配置的音频延迟设置
-            delay_enabled = config.get("audio_delay_enabled", False)
-            delay_ms = config.get("audio_delay_ms", 0)
             monitor_enabled = config.get("monitor_enabled", False)
-            
-            print(f"音频设置: 延迟={delay_enabled}, 延迟时间={delay_ms}ms, 监听={monitor_enabled}")
+            # 逐词开关每隔一会儿在循环里重新读一次（见下），勾选框改了就生效，
+            # 不必停下来重新开始
+            word_by_word = config.get("word_by_word_enabled", True)
+            partial_interval = max(0.3, config.get("partial_interval_ms", 1000) / 1000.0)
+
+            print(f"音频设置: 监听={monitor_enabled}, 逐词显示={word_by_word}"
+                  + (f", 预览识别间隔={partial_interval:.1f}秒" if word_by_word else ""))
             
             # 创建音频流
             try:
@@ -777,10 +779,20 @@ class AudioManager:
             # 音频识别缓冲区
             recognition_buffer = []
             recognition_buffer_duration = 0  # 当前缓冲区时长（秒）
-            
+
+            # ── 逐词字幕的时间轴 ──────────────────────────────────────────
+            # buffer_start_chunk / buffer_end_chunk 是当前缓冲区首尾在采集时间轴
+            # 上的块号。识别结果里的词时间是"相对这段音频开头"的秒数，加上
+            # buffer_start_chunk 就换算成了绝对位置，可以直接和播放位置比较。
+            buffer_start_chunk = self.captured_chunks
+            buffer_end_chunk = self.captured_chunks
+            # 同一句话的预览识别与最终识别共用这个编号，便于归组/替换
+            utterance_id = 0
+            last_partial_time = 0.0
+
             # 记录上次提交的时间
             last_submission_time = time.time()
-            
+
             # 性能监控变量
             frame_count = 0
             start_performance_time = time.time()
@@ -833,7 +845,11 @@ class AudioManager:
                 try:
                     # 读取音频数据
                     audio_data = self.stream.read(self.chunk_size, exception_on_overflow=False)
-                    
+
+                    # 采集时钟：每读到一块就推进一格（丢弃的预热帧也要算，
+                    # 否则时间轴会比真实时间快/慢）
+                    self.captured_chunks += 1
+
                     # 性能监控
                     frame_count += 1
                     current_time = time.time()
@@ -880,6 +896,8 @@ class AudioManager:
                         if not speech_detected and onset_frames >= onset_frames_needed:
                             print(f"检测到语音开始，音量: {current_volume}, 判定阈值: {speech_threshold:.0f}, 底噪: {noise_floor:.0f}")
                             speech_detected = True
+                            # 新的一句话：编号加一，这一句的预览/最终结果都归到它名下
+                            utterance_id += 1
                         if speech_detected:
                             silence_frames = 0  # 重置静音计数
                             has_sufficient_volume = True
@@ -905,17 +923,53 @@ class AudioManager:
                     audio_float = audio_array.astype(np.float32) / 32768.0
                     
                     # 将音频数据添加到识别缓冲区
+                    # 缓冲区是空的（刚开始录，或刚提交完一段）：这一块就是新起点。
+                    # 起点必须跟着真正进缓冲区的数据走，不能按"上一段结尾 +1"推算，
+                    # 否则预热帧（前 5 帧被丢弃）或丢帧会让整段词的时间轴偏移几十毫秒，
+                    # 字幕就会整体偏早/偏晚。
+                    if not recognition_buffer:
+                        buffer_start_chunk = self.captured_chunks
                     recognition_buffer.append(audio_float)
                     recognition_buffer_duration += self.chunk_size / self.sample_rate
-                    
+                    buffer_end_chunk = self.captured_chunks
+
                     # 限制识别缓冲区大小，防止内存泄漏（正常情况下不会触发，
                     # 因为一旦达到 max_record_seconds 就会被提交）
                     while len(recognition_buffer) > max_recognition_buffer_items:
                         removed_duration = len(recognition_buffer[0]) / self.sample_rate
                         recognition_buffer.pop(0)
+                        # 丢掉的这块不再属于缓冲区，起点跟着往后挪
+                        buffer_start_chunk += 1
                         recognition_buffer_duration -= removed_duration
                         if DEBUG_MODE and frame_count % 500 == 0:
                             print(f"缓冲区过大，已移除最早的 {removed_duration:.2f} 秒数据")
+
+                    # ── 预览识别：说话过程中先看个大概 ────────────────────────
+                    # 整句识别要等 0.5 秒静音才提交，等结果回来这句话早播完了，
+                    # 所以整句结果只能"一下子全冒出来"。要让字幕一个词一个词跟着
+                    # 语音走，就得在说话的同时用当前缓冲区先跑一次识别。
+                    # 预览只喂逐词显示（绝不进字幕文件、不触发翻译），
+                    # 最终结果到达时会把这一段整句替换掉。
+                    # 开关每帧重读：正在跑的时候勾掉/勾上就生效，不用重开
+                    word_by_word = config.get("word_by_word_enabled", True)
+                    if (word_by_word and speech_detected and silence_frames == 0
+                            and recognition_buffer_duration >= 1.0
+                            and self.audio_queue.qsize() < 2
+                            and current_time - last_partial_time >= partial_interval):
+                        if self._partial_inflight:
+                            # 上一次预览还没回来：识别跟不上，说明这台机器跑不动
+                            # 这个间隔，拉长到最多 3 秒，别让预览抢走整句识别的资源
+                            if current_time - last_partial_time > 2 * partial_interval:
+                                partial_interval = min(partial_interval * 2, 3.0)
+                                last_partial_time = current_time
+                                print(f"预览识别跟不上，间隔放宽到 {partial_interval:.1f} 秒")
+                        else:
+                            self._submit_partial(
+                                np.concatenate(recognition_buffer),
+                                utterance_id, buffer_start_chunk, buffer_end_chunk
+                            )
+                            last_partial_time = current_time
+
 
                     # 判断是否需要提交音频进行处理的条件:
                     # 1. 缓冲区达到最大时长限制 - 强制提交
@@ -964,10 +1018,19 @@ class AudioManager:
                             submitted = True
                         else:
                             try:
+                                # 带上这段音频在采集时间轴上的位置，识别回来后才
+                                # 知道"这些词是在什么时候说的"
+                                task = AudioSegmentTask(
+                                    data=recognition_data,
+                                    submit_time=time.time(),
+                                    start_chunk=buffer_start_chunk,
+                                    end_chunk=buffer_end_chunk,
+                                    utterance_id=utterance_id,
+                                )
                                 # 队列大小限制，避免堆积太多待处理任务
                                 if self.audio_queue.qsize() < 5:
                                     print(f"提交音频段到识别队列: 长度={audio_length_sec:.2f}秒, 队列大小={self.audio_queue.qsize()}, 峰值={audio_max_volume:.4f}")
-                                    self.audio_queue.put((recognition_data, time.time()))
+                                    self.audio_queue.put(task)
                                     submitted = True
                                     last_submission_time = time.time()
                                 else:
@@ -975,12 +1038,12 @@ class AudioManager:
                                     # 语音一定能进去（旧代码在这里直接跳过，而且下面还会把
                                     # 缓冲区清空，等于白白丢掉一段语音）
                                     try:
-                                        dropped, _ = self.audio_queue.get_nowait()
+                                        dropped = self.audio_queue.get_nowait()
                                         self.audio_queue.task_done()
-                                        print(f"识别队列已满，丢弃最旧的一段({len(dropped)/self.sample_rate:.2f}秒)后提交")
+                                        print(f"识别队列已满，丢弃最旧的一段({len(dropped.data)/self.sample_rate:.2f}秒)后提交")
                                     except queue.Empty:
                                         pass
-                                    self.audio_queue.put((recognition_data, time.time()))
+                                    self.audio_queue.put(task)
                                     submitted = True
                                     last_submission_time = time.time()
                             except Exception as e:
@@ -993,6 +1056,8 @@ class AudioManager:
                             # 没有去重而制造重复词（实测词错率 10.4% → 14.6%）。
                             recognition_buffer = []
                             recognition_buffer_duration = 0
+                            # 起点不用在这里算：缓冲区一空，下一块进来时会自己
+                            # 认成新起点（见上面 append 之前的那段）
                             silence_frames = 0
                             speech_detected = False
                             onset_frames = 0
@@ -1024,12 +1089,12 @@ class AudioManager:
             print("录音线程已结束")
             
     def _playback_audio(self, stop_event=None):
-        """专门的音频播放线程 - 只负责播放音频，与识别完全分离"""
-        try:
-            # 获取延迟设置
-            delay_enabled = config.get("audio_delay_enabled", False)
-            delay_ms = config.get("audio_delay_ms", 0)
+        """专门的音频播放线程 - 只负责播放音频，与识别完全分离
 
+        采一块、播一块，不做任何人为延迟：字幕是按真实播放进度对齐的
+        （见 get_play_position_chunks），音频再延迟只会让人听到的声音更晚。
+        """
+        try:
             # 创建输出流
             try:
                 # 如果PyAudio实例不存在，初始化它
@@ -1061,22 +1126,8 @@ class AudioManager:
                 print(f"创建音频输出流失败: {str(e)}")
                 return
 
-            # 延迟缓冲区
-            delay_buffer = deque(maxlen=10000)  # 足够大的缓冲区
             last_error_log_time = 0.0  # 播放出错时限制日志频率
-            
-            # 如果启用延迟，计算延迟帧数并预填充缓冲区
-            delay_frames = 0
-            if delay_enabled and delay_ms > 0:
-                delay_frames = int((delay_ms / 1000.0) * self.sample_rate / self.chunk_size)
-                print(f"播放线程: 延迟设置为 {delay_frames} 帧 (约 {delay_ms} 毫秒)")
-                
-                # 预填充静音
-                silent_frame = bytes(self.chunk_size * self.channels * 2)  # 16位音频 = 2字节/样本
-                for _ in range(delay_frames):
-                    delay_buffer.append(silent_frame)
-                print(f"播放线程: 已预填充 {delay_frames} 帧静音数据")
-            
+
             # 播放循环：is_running 表示整体在录音，stop_event 表示监听被单独关掉
             while self.is_running and not (stop_event is not None and stop_event.is_set()):
                 try:
@@ -1087,26 +1138,12 @@ class AudioManager:
                         # 队列为空，播放静音保持连续性
                         if output_stream.is_active():
                             silent_frame = bytes(self.chunk_size * self.channels * 2)
-                            if delay_enabled and delay_ms > 0:
-                                # 添加静音帧到延迟缓冲区
-                                delay_buffer.append(silent_frame)
-                                if len(delay_buffer) > 0:
-                                    output_stream.write(delay_buffer.popleft())
-                            else:
-                                output_stream.write(silent_frame)
+                            output_stream.write(silent_frame)
                         self._update_output_volume(0.0)
                         continue
 
-                    # 延迟播放逻辑
-                    if delay_enabled and delay_ms > 0:
-                        # 将新数据添加到延迟缓冲区
-                        delay_buffer.append(audio_data)
-                        # 始终播放最早的帧，保持连续流动
-                        if len(delay_buffer) > 0:
-                            output_stream.write(delay_buffer.popleft())
-                    else:
-                        # 直接播放，无延迟
-                        output_stream.write(audio_data)
+                    # 直接播放，不做人为延迟
+                    output_stream.write(audio_data)
 
                     # 写成功之后才更新音量表——这样音量表反映的是真正写进输出设备的
                     # 数据，不会出现"音量表在动但耳机没声音"的误导
@@ -1147,6 +1184,60 @@ class AudioManager:
             self._output_volume_time = 0.0
             print("音频播放线程已结束")
             
+    def _timed_words(self, words, start_chunk):
+        """把词时间（相对音频段开头的秒数）换算成采集时间轴上的块号"""
+        timed = []
+        for word in words or []:
+            try:
+                start = start_chunk + int(round(
+                    float(word["start"]) * self.sample_rate / self.chunk_size))
+                end = start_chunk + int(round(
+                    float(word["end"]) * self.sample_rate / self.chunk_size))
+            except (KeyError, TypeError, ValueError):
+                continue
+            timed.append(TimedWord(word.get("word", ""), start, max(start, end)))
+        return timed
+
+    def _submit_partial(self, audio_snapshot, utterance_id, start_chunk, end_chunk):
+        """提交一次预览识别（说话过程中先看个大概）
+
+        结果只进逐词显示通道：不进 text_queue、不进字幕文件、不触发翻译。
+        半截句子的错误识别只会在屏幕上闪一下，最终结果一到就被整句替换。
+        """
+        self._partial_inflight = True
+
+        def on_partial_complete(result, utterance=utterance_id,
+                                seg_start=start_chunk, seg_end=end_chunk):
+            try:
+                if "error" in result:
+                    return
+                words = self._timed_words(result.get("words"), seg_start)
+                if not words:
+                    return
+                self.word_queue.append(WordSegment(
+                    utterance_id=utterance, words=words,
+                    start_chunk=words[0].start_chunk, end_chunk=seg_end,
+                    is_final=False, text=result.get("text", ""),
+                ))
+                if DEBUG_MODE:
+                    print(f"[预览识别] 第{utterance}句: {len(words)}个词, "
+                          f"块 {seg_start}~{seg_end}")
+            finally:
+                self._partial_inflight = False
+
+        try:
+            task_id = self.audio_processor.process_audio_async(
+                audio_snapshot, on_partial_complete, kind="partial")
+        except Exception as e:
+            print(f"提交预览识别失败: {str(e)}")
+            self._partial_inflight = False
+            return
+
+        if task_id is None and self._partial_inflight:
+            # 线程池正忙着整句识别：这次预览直接跳过。预览永远不排队，
+            # 否则它会排在整句结果前面，把真正的字幕往后拖。
+            self._partial_inflight = False
+
     def _recognize_audio(self):
         """使用Whisper模型识别音频"""
         # 最大队列长度 - 超过此长度时将自动丢弃旧的音频数据
@@ -1182,10 +1273,11 @@ class AudioManager:
                     
                     print(f"队列过长，丢弃了 {dropped_count} 条旧的音频数据")
                 
-                # 尝试从队列获取音频数据和开始时间（等待最多0.5秒）
+                # 尝试从队列获取音频数据（等待最多0.5秒）
                 try:
-                    audio_data, start_time = self.audio_queue.get(timeout=0.5)
-                    wait_time = time.time() - start_time
+                    task = self.audio_queue.get(timeout=0.5)
+                    audio_data = task.data
+                    wait_time = time.time() - task.submit_time
                     print(f"从队列获取到音频数据，等待时间: {wait_time:.2f}秒, 数据形状: {audio_data.shape}, 大小: {audio_data.size}, 最大值: {np.max(np.abs(audio_data)):.4f}")
                     processed_count += 1
                 except queue.Empty:
@@ -1238,7 +1330,11 @@ class AudioManager:
                         print(f"准备识别的音频: 形状={audio_np.shape}, 类型={audio_np.dtype}, 最大值={np.max(audio_np)}, 最小值={np.min(audio_np)}")
                     
                     # 定义结果回调函数，在异步处理完成后处理结果
-                    def on_recognition_complete(result):
+                    # 时间信息用默认参数绑死：回调是异步的，可能在这轮循环结束
+                    # 之后才执行，直接引用外层变量会读到下一段音频的值
+                    def on_recognition_complete(result, utterance=task.utterance_id,
+                                                seg_start=task.start_chunk,
+                                                seg_end=task.end_chunk):
                         try:
                             print(f"收到识别结果回调: result_id={result.get('task_id')}")
                             
@@ -1281,6 +1377,19 @@ class AudioManager:
                                     # 添加到字幕管理器
                                     self.subtitle_manager.add_subtitle(text)
                                     print(f"已添加到字幕管理器")
+
+                                    # 逐词显示：最终结果的词表替换掉同一句的预览结果
+                                    words = self._timed_words(result.get("words"), seg_start)
+                                    if words:
+                                        self.word_queue.append(WordSegment(
+                                            utterance_id=utterance, words=words,
+                                            start_chunk=words[0].start_chunk,
+                                            end_chunk=seg_end,
+                                            is_final=True, text=text,
+                                        ))
+                                        if DEBUG_MODE:
+                                            print(f"逐词显示: 第{utterance}句最终结果 "
+                                                  f"{len(words)}个词, 块 {seg_start}~{seg_end}")
                                     
                                     # 将UI更新任务放入UI更新队列，不直接在这里更新
                                     ui_update_queue.put(("text_update", text))
@@ -1354,6 +1463,35 @@ class AudioManager:
             print(f"从文本队列获取最新文本: '{latest_text[:30]}...'")
         return latest_text
         
+    def take_word_segments(self):
+        """取走待显示的逐词片段（界面主线程调用，取走即清空）"""
+        if not self.word_queue:
+            return []
+        segments = list(self.word_queue)
+        self.word_queue.clear()
+        return segments
+
+    def get_captured_chunks(self):
+        """本轮录音已采集的音频块数（1 块 = 1024 样本 ≈ 64ms）"""
+        return self.captured_chunks
+
+    def get_play_position_chunks(self):
+        """用户"此刻听到"的音频在采集时间轴上的块号
+
+        监听开启时，播放队列里堆的正是"已经采集、还没送进输出设备"的音频，
+        用户听到的就是队列最前面那一块，再补上输出设备自身的缓冲（几块）。
+        监听关闭时用户直接听电台声音，按实时采集算——也就是零延迟。
+
+        这个值取代了原来那个"手动加音频延迟"的滑块：延迟是多少不用猜，
+        数一数还有多少块没播出去就知道了，而且每时每刻都在自动更新。
+        """
+        position = self.captured_chunks
+        thread = self.playback_thread
+        if thread is not None and thread.is_alive() and self.output_error is None:
+            lag = self.playback_queue.qsize() + _OUTPUT_BUFFER_CHUNKS
+            position -= min(lag, _MAX_LAG_CHUNKS)
+        return max(0, position)
+
     def get_detected_language(self):
         """获取检测到的语言代码
 
@@ -1655,66 +1793,7 @@ class AudioManager:
         """检查是否正在记录字幕"""
         return self.subtitle_manager.is_recording()
 
-    def _audio_callback(self, in_data, frame_count, time_info, status):
-        """处理音频输入的回调函数"""
-        try:
-            if status:
-                print(f"音频回调状态: {status}")
-            
-            # 将输入数据转换为numpy数组
-            audio_data = np.frombuffer(in_data, dtype=np.float32)
-            
-            # 检测语音活动
-            current_time = time.time()
-            rms = np.sqrt(np.mean(np.square(audio_data)))
-            
-            # 语音活动检测逻辑
-            if rms > SILENCE_THRESHOLD:
-                self.is_speaking = True
-                self.last_voice_time = current_time
-                self.silence_start = None
-            elif self.is_speaking and (current_time - self.last_voice_time) > MIN_SILENCE_DURATION:
-                self.is_speaking = False
-                self.silence_start = current_time
-            
-            # 将音频数据添加到当前分段
-            self.current_segment.extend(audio_data)
-            
-            # 检查是否需要提交当前分段
-            segment_duration = len(self.current_segment) / self.sample_rate
-            if (not self.is_speaking and self.silence_start and 
-                (current_time - self.silence_start) > MIN_SILENCE_DURATION and 
-                segment_duration >= MIN_SEGMENT_DURATION) or segment_duration >= MAX_SEGMENT_DURATION:
-                
-                # 将当前分段转换为numpy数组
-                segment_array = np.array(self.current_segment, dtype=np.float32)
-                
-                # 提交音频数据
-                if len(segment_array) > 0:
-                    try:
-                        self.audio_queue.put(segment_array, block=False)
-                        print(f"提交音频分段: {len(segment_array)/self.sample_rate:.2f}秒")
-                    except queue.Full:
-                        print("警告: 音频队列已满，丢弃最旧的音频段")
-                        try:
-                            self.audio_queue.get_nowait()  # 移除最旧的音频段
-                            self.audio_queue.put(segment_array, block=False)
-                        except:
-                            pass
-                
-                # 重置当前分段
-                self.current_segment = []
-                self.silence_start = None
-            
-            # 播放延迟的音频
-            if self.audio_delay_enabled:
-                self.delayed_audio_queue.put(audio_data)
-            
-            return (in_data, pyaudio.paContinue)
-            
-        except Exception as e:
-            error_msg = f"处理音频数据时出错: {str(e)}"
-            logger.error(error_msg)
-            if DEBUG_MODE:
-                print(error_msg)
-            return (in_data, pyaudio.paContinue) 
+    # 注：这里原有一个 _audio_callback（PyAudio 回调式录音）已删除。
+    # 它从来没被用上（录音走 _record_audio 的阻塞式 read），而且它往
+    # audio_queue 里放的是裸数组，与新的事件结构（AudioSegmentTask）不一致；
+    # 语音活动检测的参数全部在 _record_audio 内部，删掉它与那四个模块级常量。

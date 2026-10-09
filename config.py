@@ -1,8 +1,14 @@
 import json
 import os
+import shutil
+import threading
 import traceback
 
 class Config:
+    # 写文件用的锁：识别线程、翻译线程里都会调 config.set，
+    # 两个线程同时 open(..., 'w') 会把文件截断成半截。
+    _write_lock = threading.Lock()
+
     def __init__(self):
         self.config_file = "settings.json"
         self.default_settings = {
@@ -25,8 +31,11 @@ class Config:
             "input_device": "",  # 输入设备
             "output_device": "",  # 输出设备
             "monitor_enabled": False,  # 是否监听系统声音
-            "audio_delay_enabled": False,  # 是否启用音频延迟
-            "audio_delay_ms": 0,  # 音频延迟毫秒数
+            # 原文字幕逐词显示：边说边识别，字幕跟着听到的语音一个词一个词冒出来。
+            # 关闭则退回"整句识别完再一次性显示"。
+            "word_by_word_enabled": True,
+            # 说话过程中每隔多少毫秒提交一次预览识别（逐词显示靠它）
+            "partial_interval_ms": 1000,
             "main_window_width": 800,  # 主窗口宽度
             "main_window_height": 600,   # 主窗口高度
             "show_audio_stats": True,  # 是否显示音频数据统计信息 - 修改为默认开启
@@ -38,21 +47,47 @@ class Config:
 
     def load_settings(self):
         """加载配置文件"""
-        if os.path.exists(self.config_file):
+        if not os.path.exists(self.config_file):
+            return self.default_settings.copy()
+        try:
+            with open(self.config_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            # 以前这里默默吞掉异常返回默认值：文件坏了看不出来，
+            # 界面上只表现为"设置全变回默认"（模型从 tiny 变回 base 之类）。
+            # 现在留一份 .broken 备份并明确报出来，免得用户以为自己改的设置丢了。
+            print(f"读取配置文件失败，改用默认设置: {e}")
+            traceback.print_exc()
             try:
-                with open(self.config_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                return self.default_settings.copy()
-        return self.default_settings.copy()
+                shutil.copyfile(self.config_file, self.config_file + ".broken")
+                print(f"原文件已备份为 {self.config_file}.broken")
+            except OSError as backup_error:
+                print(f"备份原文件失败: {backup_error}")
+            return self.default_settings.copy()
 
     def save_settings(self):
-        """保存配置到文件"""
+        """保存配置到文件（原子写：先写临时文件，成功后再替换）
+
+        直接 open(..., 'w') 会先把 settings.json 截成 0 字节再慢慢写，
+        中途出错或进程被杀就只剩一个空文件（本机实测发生过一次，
+        代价是所有设置悄悄回落到默认值）。改成写 .tmp 再 os.replace：
+        只有整份 JSON 写完才会替换正式文件，任何一步失败都保留上一份完整配置。
+        """
+        tmp_file = self.config_file + ".tmp"
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, ensure_ascii=False, indent=4)
+            with self._write_lock:
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.settings, f, ensure_ascii=False, indent=4)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_file, self.config_file)
         except Exception as e:
             print(f"保存配置文件时出错: {e}")
+            traceback.print_exc()
+            try:
+                os.remove(tmp_file)
+            except OSError:
+                pass
 
     def ensure_all_settings_exist(self):
         """确保所有默认设置项都存在于当前设置中"""

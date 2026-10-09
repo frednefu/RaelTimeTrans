@@ -7,6 +7,9 @@ from PySide6.QtWidgets import QApplication
 # 调试开关，控制是否输出调试信息
 DEBUG_MODE = False
 
+# 逐词行左边的额外留白（标签自身的内边距之外）：词贴着窗边不好看
+REVEAL_LEFT_MARGIN = 14
+
 class SubtitleWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -69,6 +72,15 @@ class SubtitleWindow(QMainWindow):
         layout.addWidget(self.original_label)
         layout.addWidget(self.translation_label)
         
+        # 逐词行的排版状态：左边留多少白（见 set_original_words）。
+        # 标签本身照旧占满整行、文本超长照样换行，只有文字整体右移。
+        self._original_inset = 0
+        self._translation_inset = 0
+        self._original_padding = 12
+        self._translation_padding = 12
+        self.original_color = "white"
+        self.translation_color = "white"
+
         # 初始化属性
         self.window_width = 800  # 默认窗口宽度
         self.window_height = 200  # 默认窗口高度
@@ -174,12 +186,12 @@ class SubtitleWindow(QMainWindow):
     def set_original_color(self, color):
         """设置原文颜色"""
         self.original_color = color  # 保存为实例属性
-        self.original_label.setStyleSheet(f"color: {color}; background-color: transparent;")
-    
+        self._refresh_label_styles()
+
     def set_translation_color(self, color):
         """设置译文颜色"""
         self.translation_color = color  # 保存为实例属性
-        self.translation_label.setStyleSheet(f"color: {color}; background-color: transparent;")
+        self._refresh_label_styles()
     
     def set_position(self, position):
         """设置字幕位置"""
@@ -209,18 +221,28 @@ class SubtitleWindow(QMainWindow):
         self.subtitle_mode = mode
         # 更新标签可见性
         self.update_labels_visibility()
+        # 行数变了（原文行要不要两行），窗口高度跟着调
+        self.adjustLabelHeights()
+        self._fit_window_height()
     
+    def translation_disabled(self):
+        """目标语言选了"不翻译"：只解析原文，不产生译文"""
+        return config.get("target_language", "en") == "none"
+
+    def _visible_labels(self):
+        """按当前模式该显示哪几行"""
+        if self.translation_disabled() or self.subtitle_mode == "original":
+            # "不翻译"模式：只有原文行，"不翻译"时译文行没有内容可显示
+            return [self.original_label]
+        if self.subtitle_mode == "translated":
+            return [self.translation_label]
+        return [self.original_label, self.translation_label]  # both
+
     def update_labels_visibility(self):
         """根据字幕模式更新标签的可见性"""
-        if self.subtitle_mode == "translated":
-            self.original_label.hide()
-            self.translation_label.show()
-        elif self.subtitle_mode == "original":
-            self.original_label.show()
-            self.translation_label.hide()
-        else:  # both
-            self.original_label.show()
-            self.translation_label.show()
+        visible = self._visible_labels()
+        for label in (self.original_label, self.translation_label):
+            label.setVisible(label in visible)
     
     def update_text(self, original_text=None, translation_text=None):
         """更新字幕文本"""
@@ -239,12 +261,13 @@ class SubtitleWindow(QMainWindow):
             # 检查原文是否发生变化
             if original_text != self.original_label.text():
                 needs_update = True
-                self.original_label.setText(original_text)
-            
+                self._set_sentence_text(self.original_label, original_text)
+
             # 在翻译模式下，检查译文是否需要更新
-            if subtitle_mode == "translated" and original_text != self.translation_label.text():
+            if (subtitle_mode == "translated" and not self.translation_disabled()
+                    and original_text != self.translation_label.text()):
                 needs_update = True
-                self.translation_label.setText(original_text)
+                self._set_sentence_text(self.translation_label, original_text)
         else:
             # 双参数调用，分别设置原文和译文
             if DEBUG_MODE:
@@ -253,18 +276,20 @@ class SubtitleWindow(QMainWindow):
             # 设置原文（如果提供）
             if original_text is not None and original_text != self.original_label.text():
                 needs_update = True
-                self.original_label.setText(original_text)
-            
+                self._set_sentence_text(self.original_label, original_text)
+
             # 设置译文（如果提供）
             if translation_text is not None and translation_text != self.translation_label.text():
                 needs_update = True
-                self.translation_label.setText(translation_text)
-            
+                self._set_sentence_text(self.translation_label, translation_text)
+
             # 特殊处理：如果在翻译模式但没有译文，则使用原文代替
-            if (not translation_text and subtitle_mode == "translated" and 
+            # （"不翻译"模式下不顶替：译文行本该是空的，而且它已被隐藏）
+            if (not translation_text and subtitle_mode == "translated" and
+                not self.translation_disabled() and
                 original_text and original_text != self.translation_label.text()):
                 needs_update = True
-                self.translation_label.setText(original_text)
+                self._set_sentence_text(self.translation_label, original_text)
         
         # 只有在文本发生变化时才调整标签高度和更新UI
         if needs_update:
@@ -278,15 +303,155 @@ class SubtitleWindow(QMainWindow):
             # 更新标签的可见性
             self.update_labels_visibility()
     
+    def _label_stylesheet(self, color, padding, inset):
+        """标签样式：padding-left 单独写一行覆盖 padding 简写
+
+        效果是文字整块右移 inset 像素，标签自己还是占满整行（超长文本照旧在右边
+        换行）。逐词行就靠它做到"左边留白固定、新词往右边长"，而不用挪标签。
+        """
+        return (f"color: {color}; background-color: transparent; "
+                f"padding: {padding}px; padding-left: {padding + inset}px; "
+                f"border-radius: 5px;")
+
+    def _refresh_label_styles(self):
+        self.original_label.setStyleSheet(self._label_stylesheet(
+            self.original_color, self._original_padding, self._original_inset))
+        self.translation_label.setStyleSheet(self._label_stylesheet(
+            self.translation_color, self._translation_padding, self._translation_inset))
+
+    def _reveal_label(self):
+        """逐词原文写进哪个标签：原文行可见就写原文行；"仅显示译文"模式下原文行是
+        隐藏的，就沿用整句通路的做法先写进译文行占位，等译文到达再替换"""
+        if self.subtitle_mode == "translated" and not self.translation_disabled():
+            return self.translation_label
+        return self.original_label
+
+    def _set_label_inset(self, label, inset):
+        if label is self.original_label:
+            self._original_inset = inset
+        else:
+            self._translation_inset = inset
+
+    def _get_label_inset(self, label):
+        return self._original_inset if label is self.original_label else self._translation_inset
+
+    def _apply_reveal_layout(self, label):
+        """逐词行：文字左对齐 + 固定的左边留白
+
+        左对齐是关键：词一个个往右边加，左边一动不动。要是居中，每多一个字整行就
+        重新排一次，看着一直在抖。
+        """
+        if (self._get_label_inset(label) == REVEAL_LEFT_MARGIN
+                and label.alignment() & Qt.AlignmentFlag.AlignLeft):
+            return  # 已经摆好了，不用重新上样式（样式一改就会重绘）
+        self._set_label_inset(label, REVEAL_LEFT_MARGIN)
+        label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._refresh_label_styles()
+
+    def _apply_sentence_layout(self, label):
+        """整句通路写进来的文本一律居中排版
+
+        逐词行可能刚把这个标签设成左对齐（"仅显示译文"模式下逐词原文先占着译文行），
+        整句原文/译文写进来时得把它恢复成原来的样子。
+        """
+        if (self._get_label_inset(label) == 0
+                and not label.alignment() & Qt.AlignmentFlag.AlignLeft):
+            return
+        self._set_label_inset(label, 0)
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._refresh_label_styles()
+
+    def _set_sentence_text(self, label, text):
+        """整句通路写文本：顺带恢复居中排版"""
+        label.setText(text)
+        self._apply_sentence_layout(label)
+
+    def _reveal_avail_width(self, label):
+        """逐词行的文字实际能占的宽度：标签宽度扣掉左右内边距和左边的额外留白
+
+        截断上一句时要按这个宽度算，宽一点点它就会折成两行，把当前句挤出去。
+        """
+        padding = (self._original_padding if label is self.original_label
+                   else self._translation_padding)
+        width = label.width()
+        if width <= 1:
+            # 还没排过版（字幕窗第一次显示之前），先按窗口宽度估
+            width = max(self.width(), self.window_width) - 4  # 4 = 布局左右边距 2+2
+        return max(1, width - 2 * padding - REVEAL_LEFT_MARGIN)
+
+    def _reveal_two_lines(self):
+        """原文行是否按"上一句 + 当前句"两行显示（逐词模式、且原文行看得见时）"""
+        return (config.get("word_by_word_enabled", True)
+                and not self.translation_disabled()
+                and self.subtitle_mode != "translated")
+
+    def _compose_reveal_text(self, target, current_text, previous_text):
+        """拼出要写进标签的文本：当前句在新的一行，上一句在上面当上下文
+
+        只有原文行显示两行（"仅显示译文"模式下逐词原文只是暂借译文行占位，
+        待会儿整句译文要把它整行换掉）。上一句太长就截断加省略号，保证当前句
+        永远看得见——总高两行才稳，跟 YouTube 的字幕框一个道理。
+        """
+        if not previous_text or target is not self.original_label or not self._reveal_two_lines():
+            return current_text
+        metrics = QFontMetrics(target.font())
+        previous = metrics.elidedText(previous_text, Qt.TextElideMode.ElideRight,
+                                      self._reveal_avail_width(target))
+        return f"{previous}\n{current_text}"
+
+    def reset_reveal_layout(self):
+        """逐词开关被关掉时调用：把两行都恢复成居中，窗口高度也跟着回退"""
+        self._set_label_inset(self.original_label, 0)
+        self._set_label_inset(self.translation_label, 0)
+        self.original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.translation_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._refresh_label_styles()
+        self.adjustLabelHeights()
+        self._fit_window_height()
+
+    def set_original_words(self, original_text, previous_text=None, utterance_id=None):
+        """逐词显示原文：把"此刻已经念到的词"拼成一行写上去
+
+        写哪一行跟整句原文的规矩一致（见 `_reveal_label`）。排版固定左对齐：
+        新词在右边接着加，左边一动不动。`previous_text` 是上一句的全文，会显示在
+        上面那一行当上下文（只有原文行、且逐词模式开着时）。
+
+        文本没变就直接返回（逐词只会变长），200ms 轮询不会反复重绘。
+        """
+        if not original_text:
+            return
+
+        target = self._reveal_label()
+        text = self._compose_reveal_text(target, original_text, previous_text)
+
+        if text == target.text():
+            self._apply_reveal_layout(target)
+            return
+
+        target.setText(text)
+        self._apply_reveal_layout(target)
+        self.adjustLabelHeights()
+
+        if not self.isVisible():
+            self.show()
+
+        self.update_labels_visibility()
+
+    def clear_translation(self):
+        """清空译文行（切到"不翻译"时，把上一句译文从屏幕上撤掉）"""
+        if self.translation_label.text():
+            self.translation_label.setText("")
+        self.update_labels_visibility()
+
     def set_text(self, original_text="", translation_text=""):
         """设置预览文本"""
         # 设置标签文本
         if original_text is not None:
-            self.original_label.setText(original_text)
-        
+            self._set_sentence_text(self.original_label, original_text)
+
         if translation_text is not None:
-            self.translation_label.setText(translation_text)
-        
+            self._set_sentence_text(self.translation_label, translation_text)
+
         # 确保标签高度正确
         self.adjustLabelHeights()
         
@@ -380,10 +545,11 @@ class SubtitleWindow(QMainWindow):
         """显示窗口前先更新位置和尺寸"""
         # 确保窗口可见
         self.setVisible(True)
-        
-        # 应用保存的窗口尺寸
-        self.resize(self.window_width, self.window_height)
-        
+
+        # 应用保存的窗口尺寸（两行原文放不下时按需撑高）
+        self.adjustLabelHeights()
+        self.resize(self.window_width, max(self.window_height, self._required_height()))
+
         # 更新位置
         from config import config
         position = config.get("position", "bottom")
@@ -494,22 +660,16 @@ class SubtitleWindow(QMainWindow):
         
         # 对原文标签应用样式
         self.original_label.setFont(original_font)
-        self.original_label.setStyleSheet(f"""
-            color: {original_color};
-            background-color: transparent;
-            padding: {original_padding}px;
-            border-radius: 5px;
-        """)
-        
+        self.original_color = original_color
+        self._original_padding = original_padding
+
         # 对译文标签应用样式
         self.translation_label.setFont(translation_font)
-        self.translation_label.setStyleSheet(f"""
-            color: {translation_color};
-            background-color: transparent;
-            padding: {translation_padding}px;
-            border-radius: 5px;
-        """)
-        
+        self.translation_color = translation_color
+        self._translation_padding = translation_padding
+
+        self._refresh_label_styles()
+
         # 确保位置更新
         self.update_position()
         
@@ -564,10 +724,11 @@ class SubtitleWindow(QMainWindow):
         
         # 确保标签高度正确
         self.adjustLabelHeights()
-        
+
         # 应用保存的窗口尺寸，使用setFixedSize确保精确尺寸
-        self.setFixedSize(self.window_width, self.window_height)
-        
+        # （两行原文 + 译文比用户设的高度还高时按需撑高，不然第二行会被切掉）
+        self.setFixedSize(self.window_width, max(self.window_height, self._required_height()))
+
         # 应用后恢复可调整大小
         QApplication.processEvents()
         self.setMinimumSize(1, 1)
@@ -598,21 +759,38 @@ class SubtitleWindow(QMainWindow):
         # 调用父类方法关闭窗口
         super().close()
 
+    def _label_line_height(self, label):
+        """一行文字需要的高度（字高 + 上下内边距）"""
+        font = label.font()
+        padding = max(10, font.pointSize() // 2)
+        return QFontMetrics(font).height() + padding * 2
+
     def adjustLabelHeights(self):
-        """根据当前字体调整标签高度"""
-        # 调整原文标签高度
-        original_font = self.original_label.font()
-        metrics = QFontMetrics(original_font)
-        line_height = metrics.height()
-        padding = max(10, original_font.pointSize() // 2)
-        self.original_label.setMinimumHeight(line_height + padding * 2)
-        
-        # 调整译文标签高度
-        translation_font = self.translation_label.font()
-        metrics = QFontMetrics(translation_font)
-        line_height = metrics.height()
-        padding = max(10, translation_font.pointSize() // 2)
-        self.translation_label.setMinimumHeight(line_height + padding * 2)
-        
+        """根据当前字体调整标签高度
+
+        原文行在逐词模式下要放两行（上一句 + 当前句），高度按两行算——窗口高度
+        不够时由 `_fit_window_height` 把窗口撑高，不然第二行会被切掉。
+        """
+        lines = 2 if self._reveal_two_lines() else 1
+        self.original_label.setMinimumHeight(self._label_line_height(self.original_label) * lines)
+        self.translation_label.setMinimumHeight(self._label_line_height(self.translation_label))
+
         if DEBUG_MODE:
-            print(f"调整标签高度: 原文高度={self.original_label.minimumHeight()}, 译文高度={self.translation_label.minimumHeight()}") 
+            print(f"调整标签高度: 原文高度={self.original_label.minimumHeight()}"
+                  f"({lines}行), 译文高度={self.translation_label.minimumHeight()}")
+
+    def _required_height(self):
+        """按当前可见的行数算出窗口需要的总高度"""
+        height = 4  # 布局上下边距 2+2
+        for label in self._visible_labels():
+            height += label.minimumHeight()
+        return height
+
+    def _fit_window_height(self):
+        """窗口高度不够放不下时按需撑高（用户设的窗口高度当作下限）"""
+        if not self.isVisible():
+            return
+        height = max(self.window_height, self._required_height())
+        if height != self.height():
+            self.resize(self.window_width, height)
+            self.update_position()

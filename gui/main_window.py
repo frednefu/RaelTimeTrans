@@ -17,6 +17,7 @@ from translation.subtitle_manager import SubtitleManager
 from translation.translation_worker import TranslationWorker
 from gui.subtitle_window import SubtitleWindow
 from gui.volume_meter import VolumeMeter
+from gui.word_reveal import WordReveal
 from config import config
 
 # 调试开关，控制是否输出调试信息到控制台
@@ -66,6 +67,9 @@ class MainWindow(QMainWindow):
         # 记录当前显示的文本，避免重复更新相同内容
         self.current_displayed_text = ""
         self.current_displayed_translation = ""
+
+        # 逐词字幕调度：音频管理器给词表，这里按播放进度决定显示到哪个词
+        self.word_reveal = WordReveal()
         
         # 创建初始化标志，避免重复初始化模型
         self.model_initialized = False
@@ -193,38 +197,16 @@ class MainWindow(QMainWindow):
         self.monitor_hint_label.setWordWrap(True)
         self.monitor_hint_label.setStyleSheet("color: #555555;")
 
-        # 添加延迟控制部分
-        delay_layout = QHBoxLayout()
-        self.audio_delay_checkbox = QCheckBox("添加音频延迟")
-        self.audio_delay_checkbox.setToolTip("延迟音频播放以匹配字幕显示")
-        
-        delay_label = QLabel("延迟(ms):")
-        self.audio_delay_slider = QSlider(Qt.Orientation.Horizontal)
-        self.audio_delay_slider.setMinimum(0)
-        self.audio_delay_slider.setMaximum(5000)  # 最大5秒延迟
-        self.audio_delay_slider.setSingleStep(50)
-        self.audio_delay_slider.setPageStep(200)
-        self.audio_delay_slider.setToolTip("调整音频延迟时间（毫秒）")
-        
-        self.audio_delay_value_label = QLabel("0")
-        self.audio_delay_value_label.setMinimumWidth(40)
-        
         # 音频数据统计选项
         self.show_audio_stats_checkbox = QCheckBox("显示音频数据统计信息")
         self.show_audio_stats_checkbox.setChecked(config.get("show_audio_stats", False))
         self.show_audio_stats_checkbox.setToolTip("显示详细的音频数据统计信息（用于调试）")
         self.show_audio_stats_checkbox.stateChanged.connect(self.on_show_audio_stats_changed)
-        
-        delay_layout.addWidget(self.audio_delay_checkbox)
-        delay_layout.addWidget(delay_label)
-        delay_layout.addWidget(self.audio_delay_slider)
-        delay_layout.addWidget(self.audio_delay_value_label)
-        
+
         device_layout.addLayout(input_layout)
         device_layout.addLayout(output_layout)
         device_layout.addWidget(self.monitor_checkbox)
         device_layout.addWidget(self.monitor_hint_label)
-        device_layout.addLayout(delay_layout)
         device_layout.addWidget(self.show_audio_stats_checkbox)
         device_group.setLayout(device_layout)
         
@@ -389,7 +371,16 @@ class MainWindow(QMainWindow):
         self.subtitle_mode_combo.setCurrentText(mode_map.get(current_mode, "仅显示译文"))
         self.subtitle_mode_combo.currentTextChanged.connect(self.on_subtitle_mode_changed)
         subtitle_mode_layout.addWidget(self.subtitle_mode_combo)
-        
+
+        # 逐词显示原文：字幕跟着听到的语音一个词一个词冒出来（像 YouTube 那样）
+        # 关掉就退回原来的"整句识别完再一次性显示"
+        self.word_by_word_checkbox = QCheckBox("原文逐词显示")
+        self.word_by_word_checkbox.setToolTip(
+            "原文字幕跟着语音一个词一个词出现（需要边说边识别，识别量约增加一倍）；\n"
+            "关闭则整句识别完再显示")
+        self.word_by_word_checkbox.setChecked(config.get("word_by_word_enabled", True))
+        self.word_by_word_checkbox.stateChanged.connect(self.on_word_by_word_changed)
+
         # 字幕窗口大小设置
         window_size_layout = QHBoxLayout()
         window_size_layout.addWidget(QLabel("窗口宽度:"))
@@ -413,6 +404,7 @@ class MainWindow(QMainWindow):
         subtitle_layout.addLayout(color_layout)
         subtitle_layout.addLayout(position_layout)
         subtitle_layout.addLayout(subtitle_mode_layout)
+        subtitle_layout.addWidget(self.word_by_word_checkbox)
         subtitle_layout.addLayout(window_size_layout)
         subtitle_group.setLayout(subtitle_layout)
         
@@ -632,23 +624,10 @@ class MainWindow(QMainWindow):
         # 设置监听选项
         self.monitor_checkbox.setChecked(config.get("monitor_enabled", False))
         
-        # 设置音频延迟选项
-        self.audio_delay_checkbox.setChecked(config.get("audio_delay_enabled", False))
-        
-        # 设置延迟滑块值
-        delay_ms = config.get("audio_delay_ms", 0)
-        self.audio_delay_slider.setValue(delay_ms)
-        self.audio_delay_value_label.setText(str(delay_ms))
-        
-        # 根据监听选项状态更新延迟控件的启用状态
-        self.update_delay_controls_state()
-        
         # 连接设置变更事件
         self.input_device_combo.currentTextChanged.connect(self.on_input_device_changed)
         self.output_device_combo.currentTextChanged.connect(self.on_output_device_changed)
         self.monitor_checkbox.stateChanged.connect(self.on_monitor_changed)
-        self.audio_delay_checkbox.stateChanged.connect(self.on_audio_delay_checked)
-        self.audio_delay_slider.valueChanged.connect(self.on_audio_delay_changed)
 
         # 开启输入音量监听（供音量表显示，未录音时也能看到输入是否有信号）
         self._refresh_input_monitor()
@@ -718,59 +697,17 @@ class MainWindow(QMainWindow):
         else:
             self.audio_manager.stop_input_monitor()
 
-    def update_delay_controls_state(self):
-        """根据监听选项的状态更新延迟控件的启用状态"""
-        is_monitor_enabled = self.monitor_checkbox.isChecked()
-        
-        # 音频延迟功能只有在监听系统声音启用时才有效
-        self.audio_delay_checkbox.setEnabled(is_monitor_enabled)
-        
-        # 延迟滑块和标签的启用状态取决于监听选项和延迟选项
-        is_delay_enabled = is_monitor_enabled and self.audio_delay_checkbox.isChecked()
-        self.audio_delay_slider.setEnabled(is_delay_enabled)
-        
-        # 更新控件提示
-        if not is_monitor_enabled:
-            self.audio_delay_checkbox.setToolTip("需要先启用监听系统声音")
-        else:
-            self.audio_delay_checkbox.setToolTip("延迟音频播放以匹配字幕显示")
-            
-    def on_audio_delay_checked(self, state):
-        """音频延迟复选框状态变化的处理"""
-        is_checked = state == Qt.CheckState.Checked.value
-        config.set("audio_delay_enabled", is_checked)
-        
-        # 更新延迟滑块和标签的启用状态
-        self.update_delay_controls_state()
-        
-        # 如果正在运行中，通知音频管理器更新延迟设置
-        if self.audio_manager.is_running:
-            self.update_audio_delay_settings()
-    
-    def on_audio_delay_changed(self, value):
-        """音频延迟滑块值变化的处理"""
-        # 更新标签显示
-        self.audio_delay_value_label.setText(str(value))
-        
-        # 保存设置
-        config.set("audio_delay_ms", value)
-        
-        # 如果正在运行中，通知音频管理器更新延迟设置
-        if self.audio_manager.is_running:
-            self.update_audio_delay_settings()
-    
-    def update_audio_delay_settings(self):
-        """更新音频管理器的延迟设置"""
-        is_delay_enabled = self.audio_delay_checkbox.isChecked()
-        delay_ms = self.audio_delay_slider.value()
-        
-        # 如果音频管理器添加了延迟设置方法，则调用
-        if hasattr(self.audio_manager, 'set_audio_delay'):
-            if is_delay_enabled:
-                self.audio_manager.set_audio_delay(delay_ms)
-            else:
-                self.audio_manager.set_audio_delay(0)
-                
+    def on_word_by_word_changed(self, state):
+        """逐词显示开关：立即写回配置，正在跑的录音线程下一帧就会读到"""
+        enabled = state == Qt.CheckState.Checked.value
+        config.set("word_by_word_enabled", enabled)
+
+        # 切换通路时把已攒下的词片段清掉：关掉是把控制权交回整句通路，
+        # 打开是从零开始攒，免得用旧片段把刚显示的整句顶回去
+        self.word_reveal.reset()
+        self.audio_manager.take_word_segments()
+        self.subtitle_window.reset_reveal_layout()
+
     def on_monitor_changed(self, state):
         """监听选项变更时的处理"""
         enabled = state == Qt.CheckState.Checked.value
@@ -788,8 +725,6 @@ class MainWindow(QMainWindow):
             if enabled and not self.output_device_combo.currentText():
                 QMessageBox.warning(self, "无法监听", "请先在“输出设备”里选择要播放到的设备。")
 
-        # 更新延迟控件的启用状态
-        self.update_delay_controls_state()
         self.update_monitor_hint()
 
     def on_test_output(self):
@@ -1076,9 +1011,11 @@ class MainWindow(QMainWindow):
                 output_device
             )
             
-            # 设置音频延迟（如果启用）
-            self.update_audio_delay_settings()
-            
+            # 新的一轮录音：清掉上一轮攒下的词片段，否则旧句子会被重新翻出来显示
+            self.word_reveal.reset()
+            self.audio_manager.take_word_segments()
+            self.subtitle_window.reset_reveal_layout()
+
             # 启动定时器
             self.timer.start()
             
@@ -1123,6 +1060,22 @@ class MainWindow(QMainWindow):
         补上。原来这两步是在同一次刷新里同步做的，而翻译要 2 秒多，所以原文也
         跟着一起等——这就是"原文不实时"的原因。
         """
+        word_by_word = config.get("word_by_word_enabled", True)
+
+        # 0) 逐词字幕：原文行按**播放进度**推进，一个词一个词冒出来
+        #    （整句识别结果总是晚于语音，光靠它就只能整句一次性蹦出）
+        if word_by_word:
+            for segment in self.audio_manager.take_word_segments():
+                self.word_reveal.add_segment(segment)
+
+            line = self.word_reveal.tick_line(self.audio_manager.get_play_position_chunks())
+            if line:
+                if self.original_preview.isVisible():
+                    self.original_preview.setText(line.text)
+                # previous_text 一并带上：显示在上一行当上下文（两行原文）
+                self.subtitle_window.set_original_words(
+                    line.text, line.previous_text, line.utterance_id)
+
         # 1) 有新识别结果：原文立即上屏，并把翻译丢给后台线程
         text = self.audio_manager.get_latest_text()
 
@@ -1130,8 +1083,11 @@ class MainWindow(QMainWindow):
             self.current_displayed_text = text
             self.current_displayed_translation = ""
 
-            print(f"新识别文本，立即显示原文: '{text[:30]}...'")
-            self._show_original_text(text)
+            print(f"新识别文本: '{text[:30]}...'")
+            # 逐词模式下原文行归第 0 步的逐词通道管，整句只用来去重、翻译和落盘，
+            # 免得整句一下子把逐词结果顶掉
+            if not word_by_word:
+                self._show_original_text(text)
 
             target_language = self.target_language_combo.currentText()
             if target_language == "不翻译":
@@ -1191,8 +1147,12 @@ class MainWindow(QMainWindow):
         print(f"应用译文（模式={subtitle_mode}）: '{translation[:30]}...'")
 
         if self.subtitle_window.isVisible():
-            self.subtitle_window.update_text(original_text=text,
-                                            translation_text=translation)
+            if config.get("word_by_word_enabled", True):
+                # 原文行正由逐词通道负责，这里只补译文，别用整句原文盖掉它
+                self.subtitle_window.update_text(translation_text=translation)
+            else:
+                self.subtitle_window.update_text(original_text=text,
+                                                 translation_text=translation)
 
     def _is_same_language(self, text):
         """判断识别出的源语言是否就是目标语言"""
@@ -1622,6 +1582,12 @@ class MainWindow(QMainWindow):
             self.translation_delay_label.hide()
         else:
             self.translation_delay_label.show()
+
+        # 字幕窗口跟着变："不翻译"只留原文行，并把上一次的译文撤掉
+        if lang_code == "none":
+            self.subtitle_window.clear_translation()
+        else:
+            self.subtitle_window.update_labels_visibility()
             
         if DEBUG_MODE:
             print(f"目标语言切换到: {language} (代码: {lang_code})")

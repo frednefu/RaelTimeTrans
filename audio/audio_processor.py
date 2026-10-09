@@ -78,6 +78,12 @@ def _is_repetition_loop(text):
     return False
 
 
+# 判定"这段没有语音"的两个阈值：no_speech_prob 高**且**平均对数概率低才算没语音。
+# 解码参数和逐段过滤词时间轴都要用，放常量里避免改一处漏一处。
+_NO_SPEECH_THRESHOLD = 0.6
+_LOGPROB_THRESHOLD = -1.0
+
+
 def transcribe_options(source_language, device="cpu"):
     """统一的 Whisper 解码参数
 
@@ -101,13 +107,21 @@ def transcribe_options(source_language, device="cpu"):
         # 这是抑制幻觉和乱码循环的主要手段
         temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         compression_ratio_threshold=2.4,
-        logprob_threshold=-1.0,
+        logprob_threshold=_LOGPROB_THRESHOLD,
         # 判定"这段没有语音"的阈值。命中时 Whisper 直接返回空文本——这正是过去
         # 用 "[声音]" 占位符想解决的问题，但占位符会一路进到翻译管线翻出垃圾字幕，
         # 所以改用 Whisper 自己的机制。
-        no_speech_threshold=0.6,
+        no_speech_threshold=_NO_SPEECH_THRESHOLD,
+        # 词级时间轴：字幕逐词显示靠它（"原文跟着语音一个词一个词冒出来"）。
+        # 代价是额外一遍 cross-attention + DTW 对齐（实测耗时增加约 7%），
+        # 换来每个词的 start/end，值得。
+        word_timestamps=True,
         fp16=(device == "cuda"),
-        verbose=False,
+        # verbose 传 None 才是"完全安静"：Whisper 的进度条条件是
+        # `disable=verbose is not False`，也就是**verbose=False 反而会打开进度条**，
+        # 而进度条是往 stderr 写的。标准流句柄一旦失效（WinError 6），这句写就会
+        # 抛异常把整次识别毁掉；顺手也省掉每秒刷屏的进度条。
+        verbose=None,
     )
 
 
@@ -150,6 +164,38 @@ def build_initial_prompt():
     if _prompt_cache is None:
         _prompt_cache = HAM_RADIO_PROMPT
     return _prompt_cache
+
+
+def extract_word_timings(result):
+    """取出词级时间轴（word_timestamps=True 时 Whisper 才会给）
+
+    时间是相对**送进去的这一整段音频开头**的秒数，跟 segment 怎么切无关
+    （Whisper 的 word 时间本来就是段内绝对时间），所以调用方可以直接用
+    "音频段起始块号 + word['start']"换算成采集时间轴上的位置。
+
+    过滤按 segment 逐段做，而不是先拼成整条再过滤：一段静音幻觉会毁掉整条，
+    逐段判断既能丢掉纯噪声段，又不会误伤同一段音频里真正说了话的部分。
+    """
+    words = []
+    for segment in result.get("segments") or []:
+        # Whisper 自己的判据：既"没语音"、平均对数概率又低，才当幻象丢掉
+        if (segment.get("no_speech_prob", 0) > _NO_SPEECH_THRESHOLD
+                and segment.get("avg_logprob", 0) < _LOGPROB_THRESHOLD):
+            continue
+        if not clean_transcribed_text(segment.get("text", "")):
+            continue
+        for word in segment.get("words") or []:
+            if word.get("start") is None or word.get("end") is None:
+                continue
+            text = " ".join(str(word.get("word", "")).split())
+            if not text:
+                continue
+            words.append({
+                "word": text,
+                "start": float(word["start"]),
+                "end": float(word["end"]),
+            })
+    return words
 
 
 class WhisperThreadPool:
@@ -246,23 +292,25 @@ class WhisperThreadPool:
                     continue
                 
                 # 提取任务信息
-                audio_data, processor, task_id, source_language, callback = task
-                
+                audio_data, processor, task_id, source_language, callback, kind = task
+
                 try:
                     # 提交任务到线程池执行，但不等待结果
                     future = self.executor.submit(
-                        self._run_whisper_task, 
-                        audio_data, 
-                        processor, 
+                        self._run_whisper_task,
+                        audio_data,
+                        processor,
                         task_id,
-                        source_language
+                        source_language,
+                        kind
                     )
-                    
+
                     # 存储Future对象和回调函数
                     self.futures[task_id] = future
                     if callback:
                         self.callbacks[task_id] = callback
-                        print(f"已为任务 {task_id} 设置回调函数")
+                        if kind == "final":
+                            print(f"已为任务 {task_id} 设置回调函数")
                     
                     # 任务已提交，标记完成
                     self.task_queue.task_done()
@@ -300,15 +348,22 @@ class WhisperThreadPool:
         for task_id, future in list(self.futures.items()):
             # 如果任务完成，处理结果
             if future.done():
-                print(f"任务 {task_id} 已完成，获取结果")
                 try:
                     # 获取结果，但不阻塞
                     result = future.result(timeout=0)
-                    
+
+                    # 预览任务每秒一次，日志只留一行，否则控制台会被刷爆
+                    is_partial = isinstance(result, dict) and result.get("kind") == "partial"
+                    if not is_partial:
+                        print(f"任务 {task_id} 已完成，获取结果")
+
                     # 打印结果
                     if result:
                         if "error" in result:
                             print(f"任务 {task_id} 出错: {result['error']}")
+                        elif is_partial:
+                            print(f"[预览识别] {task_id} 耗时={result.get('delay_ms', 0)}ms, "
+                                  f"词数={len(result.get('words') or [])}")
                         else:
                             text = result.get("text", "")
                             print(f"任务 {task_id} 完成: 耗时={result['delay_ms']}ms, 语言={result['language']}, 文本长度={len(text)}")
@@ -316,19 +371,21 @@ class WhisperThreadPool:
                                 print(f"识别文本: '{text[:50]}...'")
                             else:
                                 print(f"警告: 识别结果为空文本")
-                    
+
                     # 使用对应任务的回调函数处理结果
                     callback = self.callbacks.get(task_id) or self.result_callback
                     if callback and result:
-                        print(f"调用回调函数处理任务 {task_id} 的结果")
+                        if not is_partial:
+                            print(f"调用回调函数处理任务 {task_id} 的结果")
                         callback(result)
-                        print(f"回调函数处理完成")
+                        if not is_partial:
+                            print(f"回调函数处理完成")
                     else:
                         if not callback:
                             print(f"警告: 任务 {task_id} 完成，但没有设置回调函数")
                         if not result:
                             print(f"警告: 任务 {task_id} 完成，但结果为空")
-                        
+
                 except Exception as e:
                     print(f"获取Whisper任务 {task_id} 结果出错: {str(e)}")
                 
@@ -364,46 +421,57 @@ class WhisperThreadPool:
         if completed_tasks:
             print(f"已完成并移除 {len(completed_tasks)} 个任务: {completed_tasks}")
     
-    def _run_whisper_task(self, audio_data, processor, task_id, source_language):
-        """执行Whisper音频识别任务"""
+    def _run_whisper_task(self, audio_data, processor, task_id, source_language, kind="final"):
+        """执行Whisper音频识别任务
+
+        kind="final" 是正常的整句识别；kind="partial" 是说话过程中的"预览识别"，
+        结果只用于逐词显示，日志也压到最少（每秒一次，不能刷屏）。
+        """
+        verbose = (kind != "partial")
         try:
             # 获取开始时间
             start_time = time.time()
-            
+
             # 打印任务开始信息
-            print(f"开始执行Whisper任务 {task_id}")
-            
+            if verbose:
+                print(f"开始执行Whisper任务 {task_id}")
+
             # 获取模型
             try:
                 model = processor.get_model()
-                print(f"任务 {task_id} 成功获取模型: {processor.current_model_name}")
+                if verbose:
+                    print(f"任务 {task_id} 成功获取模型: {processor.current_model_name}")
             except Exception as model_error:
                 print(f"任务 {task_id} 获取模型失败: {str(model_error)}")
                 return {
                     "error": f"获取模型失败: {str(model_error)}",
-                    "task_id": task_id
+                    "task_id": task_id,
+                    "kind": kind
                 }
-            
+
             # 检查音频数据是否有效
             if audio_data is None or len(audio_data) == 0:
                 print(f"任务 {task_id} 音频数据无效")
                 return {
                     "error": "音频数据无效",
-                    "task_id": task_id
+                    "task_id": task_id,
+                    "kind": kind
                 }
-            
+
             # 检查音频信号强度
             if isinstance(audio_data, np.ndarray) and audio_data.size > 0:
                 max_val = np.max(np.abs(audio_data))
                 rms = np.sqrt(np.mean(np.square(audio_data)))
-                print(f"任务 {task_id} 音频信号: 最大值={max_val:.4f}, RMS={rms:.4f}")
-                
-                # 降低信号阈值，允许处理更多声音
-                if max_val < 0.008 or rms < 0.004:
-                    print(f"任务 {task_id} 警告: 音频信号非常弱")
-            
+                if verbose:
+                    print(f"任务 {task_id} 音频信号: 最大值={max_val:.4f}, RMS={rms:.4f}")
+
+                    # 降低信号阈值，允许处理更多声音
+                    if max_val < 0.008 or rms < 0.004:
+                        print(f"任务 {task_id} 警告: 音频信号非常弱")
+
             # 执行识别
-            print(f"任务 {task_id} 开始执行Whisper识别 (语言: {source_language})")
+            if verbose:
+                print(f"任务 {task_id} 开始执行Whisper识别 (语言: {source_language})")
             result = model.transcribe(
                 audio_data,
                 **transcribe_options(source_language,
@@ -417,71 +485,91 @@ class WhisperThreadPool:
             raw_text = result.get("text", "").strip()
             text = clean_transcribed_text(raw_text)
             detected_lang = result.get("language", "unknown")
-            if raw_text and not text:
+            # 词级时间轴：逐词显示用（时间是相对这段音频开头的秒数）
+            words = extract_word_timings(result)
+            if raw_text and not text and verbose:
                 print(f"任务 {task_id} 识别结果被判定为幻觉噪声，已丢弃: {raw_text!r}")
 
-            print(f"任务 {task_id} 完成: 耗时={proc_time}ms, 语言={detected_lang}, 文本长度={len(text)}")
-            if text:
-                print(f"识别文本: '{text[:50]}...'")
-            else:
-                print(f"未识别出文本（可能是静音或噪声）")
+            if verbose:
+                print(f"任务 {task_id} 完成: 耗时={proc_time}ms, 语言={detected_lang}, 文本长度={len(text)}")
+                if text:
+                    print(f"识别文本: '{text[:50]}...'")
+                else:
+                    print(f"未识别出文本（可能是静音或噪声）")
 
             # 返回结果
             return {
                 "text": text,
+                "words": words,
                 "language": detected_lang,
                 "delay_ms": proc_time,
-                "task_id": task_id
+                "task_id": task_id,
+                "kind": kind
             }
-            
+
         except Exception as e:
             print(f"Whisper任务 {task_id} 执行失败: {str(e)}")
             import traceback
             traceback.print_exc()
             return {
                 "error": str(e),
-                "task_id": task_id
+                "task_id": task_id,
+                "kind": kind
             }
     
-    def process_audio(self, audio_data, processor, source_language="auto", callback=None):
+    def process_audio(self, audio_data, processor, source_language="auto", callback=None,
+                      kind="final"):
         """将音频处理任务提交到线程池
-        
+
         参数:
             audio_data (np.ndarray): 音频数据
             processor (AudioProcessor): 音频处理器实例
             source_language (str): 源语言
             callback (function): 针对此任务的回调函数
-            
+            kind (str): "final"=整句识别；"partial"=预览识别（逐词显示用）
+
         返回:
-            str: 任务ID
+            str: 任务ID；预览任务被跳过时返回 None
+
+        预览任务**永远不排队**：只有在没有整句任务在等、且有空闲 worker 时才提交，
+        否则直接丢掉这一次预览（一秒后还有下一次）。识别资源永远优先给整句——
+        整句结果既上字幕又进 SRT，预览只是让字幕早点出现。
         """
+        if kind == "partial":
+            busy = (not self.task_queue.empty()
+                    or len(self.futures) >= self.executor._max_workers)
+            if busy:
+                return None
+
         # 生成任务ID
         self.task_count += 1
         task_id = f"task_{int(time.time() * 1000)}_{self.task_count}"
-        
+
         # 检查线程池是否运行
         if not self.is_running:
             self.start()
-        
+
         # 记录任务开始时间
         if not hasattr(self, 'task_start_times'):
             self.task_start_times = {}
         self.task_start_times[task_id] = time.time()
-        
-        # 打印音频数据信息
-        if isinstance(audio_data, np.ndarray):
+
+        # 打印音频数据信息。预览任务每秒提交一次，这里不出声（结果回来时打一行
+        # 就够），否则控制台会被刷爆。
+        if kind != "partial" and isinstance(audio_data, np.ndarray):
             audio_max = np.max(np.abs(audio_data)) if audio_data.size > 0 else 0
             audio_rms = np.sqrt(np.mean(np.square(audio_data))) if audio_data.size > 0 else 0
             print(f"提交音频任务 {task_id}: 形状={audio_data.shape}, 最大值={audio_max:.4f}, RMS={audio_rms:.4f}")
-            
+
             # 检查是否是静音音频
             if audio_max < 0.01 or audio_rms < 0.005:
                 print(f"警告: 音频任务 {task_id} 似乎是静音或信号很弱")
-        
+
         # 提交任务到队列，包含回调函数
-        self.task_queue.put((audio_data, processor, task_id, source_language, callback))
-        
-        print(f"已将任务 {task_id} 提交到队列，当前队列大小: {self.task_queue.qsize()}")
+        self.task_queue.put((audio_data, processor, task_id, source_language, callback, kind))
+
+        if kind == "final":
+            print(f"已将任务 {task_id} 提交到队列，当前队列大小: {self.task_queue.qsize()}")
         return task_id
     
     def set_result_callback(self, callback):
@@ -714,6 +802,7 @@ class AudioProcessor:
 
             return {
                 "text": transcribed_text,
+                "words": extract_word_timings(result),
                 "language": detected_language,
                 "delay_ms": proc_time
             }
@@ -722,40 +811,43 @@ class AudioProcessor:
             print(f"处理音频数据时出错: {str(e)}")
             return {"error": str(e)}
     
-    def process_audio_async(self, audio_data, callback=None):
+    def process_audio_async(self, audio_data, callback=None, kind="final"):
         """异步处理音频数据，不阻塞调用线程
-        
+
         参数:
             audio_data (np.ndarray): 音频数据
             callback (function): 可选的回调函数，处理完成后调用
-            
+            kind (str): "final"=整句识别；"partial"=预览识别（逐词显示用）
+
         返回:
-            str: 任务ID
+            str: 任务ID；预览任务被线程池跳过时返回 None
         """
         # 获取源语言设置
         source_language = config.get("source_language", "auto")
-        
+        verbose = (kind != "partial")
+
         # 预处理音频数据
         try:
             # 确保音频数据是numpy数组
             if not isinstance(audio_data, np.ndarray):
                 audio_data = np.array(audio_data, dtype=np.float32)
-            
+
             # 确保音频数据的形状正确
             if len(audio_data.shape) > 1:
                 audio_data = audio_data.flatten()
-            
+
             # 确保音频数据是float32类型
             if audio_data.dtype != np.float32:
                 audio_data = audio_data.astype(np.float32)
-            
+
             # 检查音频质量
             max_abs = np.max(np.abs(audio_data))
             rms = np.sqrt(np.mean(np.square(audio_data)))
             duration = len(audio_data) / 16000  # 假设采样率为16kHz
-            
-            print(f"音频质量检查: 时长={duration:.2f}秒, 最大值={max_abs:.4f}, RMS={rms:.4f}")
-            
+
+            if verbose:
+                print(f"音频质量检查: 时长={duration:.2f}秒, 最大值={max_abs:.4f}, RMS={rms:.4f}")
+
             # 检查音频是否有足够的音量 - 降低阈值以处理更多音频
             if max_abs < 0.003 or rms < 0.0015:
                 print(f"音频信号太弱，跳过处理: max={max_abs:.4f}, rms={rms:.4f}")
@@ -763,8 +855,10 @@ class AudioProcessor:
                     callback({
                         "error": "音频信号太弱，无法识别",
                         "text": "",
+                        "words": [],
                         "language": None,
-                        "delay_ms": 0
+                        "delay_ms": 0,
+                        "kind": kind
                     })
                 return None
             
@@ -786,29 +880,33 @@ class AudioProcessor:
             if len(audio_data) < min_audio_length:
                 padding = np.zeros(min_audio_length - len(audio_data), dtype=np.float32)
                 audio_data = np.concatenate([audio_data, padding])
-                print(f"音频过短，已添加静音填充至 {len(audio_data)/16000:.2f} 秒")
-            
+                if verbose:
+                    print(f"音频过短，已添加静音填充至 {len(audio_data)/16000:.2f} 秒")
+
         except Exception as e:
             print(f"预处理音频数据时出错: {str(e)}")
             if callback:
-                callback({"error": str(e)})
+                callback({"error": str(e), "kind": kind})
             return None
-        
+
         # 记录回调函数信息
         if callback:
-            print(f"设置异步处理回调函数: {callback.__name__ if hasattr(callback, '__name__') else 'unnamed_callback'}")
+            if verbose:
+                print(f"设置异步处理回调函数: {callback.__name__ if hasattr(callback, '__name__') else 'unnamed_callback'}")
         else:
             print("警告: 没有提供回调函数，结果将丢失")
-        
+
         # 直接将回调函数传递给线程池的process_audio方法
         task_id = self.thread_pool.process_audio(
-            audio_data, 
-            self, 
-            source_language, 
-            callback  # 直接传递回调函数
+            audio_data,
+            self,
+            source_language,
+            callback,  # 直接传递回调函数
+            kind
         )
-        
-        print(f"已提交异步任务: {task_id}, 回调函数: {'已设置' if callback else '未设置'}")
+
+        if kind == "final":
+            print(f"已提交异步任务: {task_id}, 回调函数: {'已设置' if callback else '未设置'}")
         return task_id
     
     def update_model(self, model_name):
