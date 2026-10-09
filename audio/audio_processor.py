@@ -7,11 +7,161 @@ import queue
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 
+# 业余无线电场景的 initial_prompt。
+#
+# Whisper 会把 initial_prompt 当作解码的"前文"，等于给模型一个领域词表：
+# 实测同一段 13 秒语音，small 模型的词错率从 14.3% 降到 7.1%，并且能把
+# "Five Niner" 正确识别成 "five nine"（术语库的信号报告转换依赖这个，识别成
+# "59 or"/"五人" 就没法还原了）。
+#
+# 改这段 prompt 前请先看下面三条踩过的坑：
+#
+# 1. Whisper 只取 prompt 编码后**最后** 224 个 token，写在前面会被截掉。
+#    所以最重要的 NATO 字母解释法必须放在**最后**。
+# 2. 不要往里拼术语库的原始词条。术语库里有一长串生造的 Q 码
+#    （QUA/QUD/QUF/…/QUR），拼进去之后模型会在**正常语音里**吐幻觉：实测把
+#    "CQ CQ CQ … standing by" 识别成了 "CQ, QU, QU, QU, … QUN, standing by"，
+#    凭空多出 "QU"、"QUN"。词表不是越长越好。
+# 3. 术语之间用空格分隔、不要用逗号：prompt 里的逗号会被输出模仿，整句被
+#    逗号切碎（"CQ, CQ, CQ, this is, Alpha…"）。
+#
+# 呼号是靠字母解释法读出来的（"Alpha Bravo Five Niner" = AB59），把字母表放在
+# 最后对呼号识别的帮助最大。
+HAM_RADIO_PROMPT = (
+    "Amateur radio contact between two stations. They exchange callsigns and "
+    "signal reports such as five nine, then sign off with 73. Words that often "
+    "appear are CQ QRZ QTH QSL QRM QRN QRP QSY roger copy over out standing by "
+    "calling this is signal report readability strength tone antenna "
+    "transceiver frequency dipole repeater callsign mobile portable. "
+    "NATO phonetic alphabet: Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel "
+    "India Juliett Kilo Lima Mike November Oscar Papa Quebec Romeo Sierra Tango "
+    "Uniform Victor Whiskey X-ray Yankee Zulu"
+)
+
+_prompt_cache = None
+
+# Whisper 对静音和噪声的典型幻觉输出。这些词一旦混进字幕，看起来就是"识别不
+# 准确"，实际上模型在那段音频里根本没听到人说话。
+_HALLUCINATION_PHRASES = [
+    "thank you", "thanks", "thank you for watching", "thanks for watching",
+    "please subscribe", "subscribe", "like and subscribe",
+    "谢谢观看", "谢谢收看", "感谢观看", "感谢收看",
+    "请订阅", "请点赞", "请评论", "字幕由", "字幕志愿者",
+]
+
+# 整条结果正好等于这些词时判定为幻觉（识别到纯静音时 Whisper 常吐这几个词）。
+# 用整条相等而不是包含来判断，避免误杀 "roger"、"over" 这类真实通联用语。
+_WHOLE_RESULT_HALLUCINATIONS = {
+    "you", "thank you", "thanks", "thank you.", "bye", "bye.", "okay", "okay.",
+    "please", "please.", "yeah", "yeah.", "so", "so.", "oh", "oh.",
+    "thank you very much", "thank you very much.", "you're welcome",
+    "♪", ".", ",", "...", "!", "?",
+}
+
+
+def _is_repetition_loop(text):
+    """判断识别结果是不是重复循环的乱码
+
+    噪声段会让 Whisper 陷入复读，输出 "ʰʰʰʰʰʰ…"、"විවිවිවි…" 这种整条几乎只有
+    一两个字符的内容。正常语句不可能长这样（字符种类必然很丰富）。
+    """
+    if len(text) < 8:
+        return False
+    if len(set(text)) <= 4:
+        return True
+    # 单个字符连续重复太多次
+    run = 1
+    for prev, cur in zip(text, text[1:]):
+        run = run + 1 if cur == prev else 1
+        if run >= 8:
+            return True
+    return False
+
+
+def transcribe_options(source_language, device="cpu"):
+    """统一的 Whisper 解码参数
+
+    同步/异步两条路径共用，避免两处参数不一致。
+
+    关于几个刻意没动的参数：
+    - beam_size 保持默认（贪心）：实测 beam_size=5 词错率没有变化，耗时却翻了
+      一倍（0.68s → 1.38s），实时场景不值得。
+    - language=None 时由 Whisper 自己检测语种；实测 2.5 秒英语片段和 6.4 秒中文
+      片段都能判对，所以"自动检测"可以放心用。
+    """
+    return dict(
+        language=source_language if source_language not in ("auto", None, "") else None,
+        task="transcribe",
+        initial_prompt=build_initial_prompt(),
+        # 每段音频是独立的，不应该拿上一段的结果当上下文：分包处本来就可能丢掉
+        # 半句话，condition_on_previous_text 在这种情况下会反复"复读"上一段
+        # （实测出现 "calling calling CQ" 这类重复）。
+        condition_on_previous_text=False,
+        # 解码失败（压缩比异常/平均对数概率过低）时按这个温度序列退火重试，
+        # 这是抑制幻觉和乱码循环的主要手段
+        temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+        compression_ratio_threshold=2.4,
+        logprob_threshold=-1.0,
+        # 判定"这段没有语音"的阈值。命中时 Whisper 直接返回空文本——这正是过去
+        # 用 "[声音]" 占位符想解决的问题，但占位符会一路进到翻译管线翻出垃圾字幕，
+        # 所以改用 Whisper 自己的机制。
+        no_speech_threshold=0.6,
+        fp16=(device == "cuda"),
+        verbose=False,
+    )
+
+
+def clean_transcribed_text(text):
+    """清掉识别结果里的幻觉短语、复读乱码和纯标点"""
+    if not text:
+        return ""
+
+    cleaned = " ".join(text.split())
+
+    # 整条就是常见的静音幻觉词
+    if cleaned.lower().strip(" .,!?") in {w.strip(" .,!?") for w in
+                                          _WHOLE_RESULT_HALLUCINATIONS}:
+        return ""
+
+    lowered = cleaned.lower()
+    # 先长后短：否则 "thank you" 会先把 "thank you for watching" 咬掉一半，
+    # 剩下 "for watching"
+    for phrase in sorted(_HALLUCINATION_PHRASES, key=len, reverse=True):
+        if phrase in lowered:
+            # 用大小写不敏感的方式整段去掉
+            idx = lowered.find(phrase)
+            while idx != -1:
+                cleaned = cleaned[:idx] + cleaned[idx + len(phrase):]
+                lowered = cleaned.lower()
+                idx = lowered.find(phrase)
+            cleaned = " ".join(cleaned.split())
+
+    if _is_repetition_loop(cleaned):
+        return ""
+
+    if not any(ch.isalnum() for ch in cleaned):
+        return ""
+    return cleaned.strip()
+
+
+def build_initial_prompt():
+    """构造 Whisper 的 initial_prompt，只构造一次"""
+    global _prompt_cache
+    if _prompt_cache is None:
+        _prompt_cache = HAM_RADIO_PROMPT
+    return _prompt_cache
+
+
 class WhisperThreadPool:
     """Whisper模型线程池，用于在后台线程中处理音频识别任务"""
-    
-    def __init__(self, max_workers=2):
-        """初始化线程池"""
+
+    def __init__(self, max_workers=1):
+        """初始化线程池
+
+        max_workers 固定为 1：模型只有一个，两个 worker 并发调用同一个 model
+        会争抢显存、拖慢单次识别，而且结果回调的顺序没有保证（字幕可能乱序）。
+        small 模型在这台机器上一次 5 秒片段约 0.35 秒，单 worker 完全跟得上。
+        """
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="whisper_worker")
         self.task_queue = queue.Queue()
         self.result_callback = None
@@ -26,6 +176,7 @@ class WhisperThreadPool:
         self.task_count = 0
         self.futures = {}  # 存储任务ID到Future的映射
         self.callbacks = {}  # 存储任务ID到回调函数的映射
+        self._slow_task_warned = set()  # 已告警过的慢任务，避免反复刷屏
     
     def start(self):
         """启动线程池工作线程"""
@@ -136,7 +287,7 @@ class WhisperThreadPool:
             
             # 检查任务是否运行时间过长
             current_time = time.time()
-            task_timeout = 10  # 减少超时时间到10秒，更快地取消卡住的任务
+            task_timeout = 30  # 仅用于告警：small/medium 模型正常远快于此
             
             # 记录当前时间戳
             if not hasattr(self, 'task_start_times'):
@@ -188,44 +339,26 @@ class WhisperThreadPool:
                 if hasattr(self, 'task_start_times'):
                     self.task_start_times.pop(task_id, None)
             
-            # 检查任务是否运行时间过长
+            # 检查任务是否运行时间过长。
+            #
+            # 这里只告警、不再取消：future.cancel() 对已经开始执行的任务是无效的，
+            # 原来的写法只是把结果丢掉，而任务仍在 worker 里跑（白占资源、又静默
+            # 少了一段字幕）。识别结果什么时候回来都比不来强——UI 层会按"是否还是
+            # 最新一条"决定要不要显示。
             elif hasattr(self, 'task_start_times') and task_id in self.task_start_times:
                 task_run_time = current_time - self.task_start_times[task_id]
                 if task_run_time > task_timeout:
-                    print(f"警告: 任务 {task_id} 运行时间过长 ({task_run_time:.1f}秒)，可能已卡住，尝试取消")
-                    try:
-                        # 尝试取消任务
-                        future.cancel()
-                        print(f"已取消任务 {task_id}")
-                        
-                        # 创建错误结果
-                        error_result = {
-                            "error": "任务运行超时",
-                            "task_id": task_id
-                        }
-                        
-                        # 调用回调通知
-                        callback = self.callbacks.get(task_id) or self.result_callback
-                        if callback:
-                            try:
-                                print(f"调用回调函数通知任务 {task_id} 超时")
-                                callback(error_result)
-                            except Exception as e:
-                                print(f"调用超时回调出错: {str(e)}")
-                        
-                        # 将任务标记为已完成
-                        completed_tasks.append(task_id)
-                        
-                        # 移除任务开始时间记录
-                        self.task_start_times.pop(task_id, None)
-                    except Exception as e:
-                        print(f"取消任务 {task_id} 时出错: {str(e)}")
+                    if task_id not in self._slow_task_warned:
+                        self._slow_task_warned.add(task_id)
+                        print(f"警告: 任务 {task_id} 运行时间已超过 {task_timeout} 秒 "
+                              f"({task_run_time:.1f}秒)，识别较慢，等待其自然完成")
         
         # 移除已完成的任务
         for task_id in completed_tasks:
             self.futures.pop(task_id, None)
             # 同时移除回调映射
             self.callbacks.pop(task_id, None)
+            self._slow_task_warned.discard(task_id)
         
         # 报告已完成的任务数
         if completed_tasks:
@@ -273,29 +406,26 @@ class WhisperThreadPool:
             print(f"任务 {task_id} 开始执行Whisper识别 (语言: {source_language})")
             result = model.transcribe(
                 audio_data,
-                language=source_language if source_language != "auto" else None,
-                task="transcribe"
+                **transcribe_options(source_language,
+                                     getattr(processor, "device", "cpu"))
             )
-            
+
             # 计算处理时间
             proc_time = int((time.time() - start_time) * 1000)
-            
+
             # 获取识别结果
-            text = result.get("text", "").strip()
+            raw_text = result.get("text", "").strip()
+            text = clean_transcribed_text(raw_text)
             detected_lang = result.get("language", "unknown")
-            
+            if raw_text and not text:
+                print(f"任务 {task_id} 识别结果被判定为幻觉噪声，已丢弃: {raw_text!r}")
+
             print(f"任务 {task_id} 完成: 耗时={proc_time}ms, 语言={detected_lang}, 文本长度={len(text)}")
             if text:
                 print(f"识别文本: '{text[:50]}...'")
             else:
-                print(f"警告: 识别结果为空文本")
-                
-                # 如果是空文本但有有效的音频，可能需要返回一个占位符文本
-                # 这样UI可以显示有声音被检测到了
-                if np.max(np.abs(audio_data)) > 0.05:  # 降低阈值，更容易生成占位符
-                    print(f"音频信号强度足够，但未识别出文本，使用占位符")
-                    text = "[声音]"  # 使用一个占位符
-            
+                print(f"未识别出文本（可能是静音或噪声）")
+
             # 返回结果
             return {
                 "text": text,
@@ -556,8 +686,7 @@ class AudioProcessor:
                 start_time = time.time()
                 result = model.transcribe(
                     whisper_input,
-                    language=source_language if source_language != "auto" else None,
-                    task="transcribe"
+                    **transcribe_options(source_language, self.device)
                 )
                 # 计算处理时间
                 proc_time = int((time.time() - start_time) * 1000)
@@ -576,35 +705,13 @@ class AudioProcessor:
             
             print(f"Whisper识别结果: 语言={detected_language}, 文本='{transcribed_text}'")
             
-            # 清理识别文本
+            # 清理识别文本（去掉幻觉短语）
             if transcribed_text:
-                # 去除常见的无意义词语
-                common_noise_words = [
-                    "thank you", "thanks", "thank you for watching", "thanks for watching",
-                    "谢谢观看", "谢谢收看", "感谢观看", "感谢收看",
-                    "please subscribe", "subscribe", "like", "comment",
-                    "请订阅", "请点赞", "请评论"
-                ]
-                
-                # 转换为小写进行比较
-                text_lower = transcribed_text.lower()
-                
-                # 检查并移除无意义词语
-                for noise in common_noise_words:
-                    if noise in text_lower:
-                        transcribed_text = transcribed_text.replace(noise, "").strip()
-                
-                # 移除多余的空格
-                transcribed_text = " ".join(transcribed_text.split())
-                
-                # 如果清理后文本为空，返回空字符串
-                if not transcribed_text.strip():
-                    transcribed_text = ""
-                    
-                # 如果文本被清理了，记录一下
-                if transcribed_text != result.get("text", ""):
-                    print(f"文本已清理，清理后: '{transcribed_text}'")
-            
+                cleaned_text = clean_transcribed_text(transcribed_text)
+                if cleaned_text != transcribed_text:
+                    print(f"文本已清理，清理后: '{cleaned_text}'")
+                transcribed_text = cleaned_text
+
             return {
                 "text": transcribed_text,
                 "language": detected_language,

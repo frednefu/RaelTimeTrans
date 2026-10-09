@@ -90,15 +90,22 @@ class SubtitleManager:
         """
         if not text:
             return ""
-            
+
         # 获取目标语言代码
         target_code = self.get_language_code(target_language)
         if not target_code:
             return text
-            
+
+        # 翻译现在由后台线程驱动。加锁一是保护 googletrans 客户端的内部状态
+        # （它不见得线程安全），二是保证术语表处理不会和其他调用交叉。
+        with self.lock:
+            return self._translate_locked(text, target_code, debug)
+
+    def _translate_locked(self, text, target_code, debug=False):
+        """实际执行翻译，调用前必须持有 self.lock"""
         # 记录开始时间
         start_time = time.time()
-        
+
         try:
             # 步骤1: 处理信号报告
             processed_text = self.term_manager.extract_and_convert_signal_report(text)

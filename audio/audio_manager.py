@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import threading
 import queue
@@ -44,6 +45,106 @@ MIN_SILENCE_DURATION = 0.5  # 最小静音持续时间（秒）
 MAX_SEGMENT_DURATION = 10.0  # 最大分段持续时间（秒）
 MIN_SEGMENT_DURATION = 0.5  # 最小分段持续时间（秒）
 
+# WDM-KS 会把未解析的资源串原样吐出来：
+#   "耳机 (@System32\drivers\bthhfenum.sys,#2;%1 Hands-Free%0\r\n;(AirPods Pro))"
+_RESOURCE_STRING_RE = re.compile(r'@[^;]*;%\d+\s*([^%]*)%0[\s;,]*\(([^)]*)\)')
+
+
+def clean_device_name(name):
+    """清理设备名称：修复中文乱码、解析资源串、移除控制字符
+
+    中文乱码来自"UTF-8 字节被当成 GBK 解码"：耳机(UTF-8 E8 80 B3 E6 9C BA)
+    会显示成 "鑰虫満"。还原办法是把字符串按 GBK 编回字节再按 UTF-8 解码。
+    对本来就正常的中文名（如"扬声器"）这一步会因 UnicodeDecodeError 失败，
+    因此只在还原确实成功且结果不同时才采用——实测 60 个设备名，16 个乱码名
+    全部还原正确，6 个正常名无一被改动。
+    """
+    if isinstance(name, bytes):
+        for encoding in ('utf-8', 'gbk', 'latin-1'):
+            try:
+                name = name.decode(encoding)
+                break
+            except UnicodeDecodeError:
+                continue
+    name = str(name)
+
+    # 1. 修复中文乱码（耳机 -> 鑰虫満）
+    try:
+        repaired = name.encode('gbk').decode('utf-8')
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        repaired = None
+    if repaired and repaired != name:
+        name = repaired
+
+    # 2. WDM-KS 的未解析资源串：@...;%1 Hands-Free%0;(AirPods Pro) -> AirPods Pro (Hands-Free)
+    match = _RESOURCE_STRING_RE.search(name)
+    if match:
+        label = match.group(1).strip()
+        device = match.group(2).strip()
+        name = name[:match.start()] + (f"{device} ({label})" if label else device) + name[match.end():]
+
+    # 3. 去掉控制字符（\r\n 之类）并压缩空白
+    name = ''.join(ch if ch >= ' ' else ' ' for ch in name)
+    name = re.sub(r'\s+', ' ', name)
+    return name.strip()
+
+
+# 设备名末尾这些括号里装的是驱动/接口的样板描述，对"这是哪台设备"没有任何区分价值，
+# 只是把下拉框撑长："DELL S2721DGF (NVIDIA High Definition Audio)" -> "DELL S2721DGF"
+# 而 "(AirPods Pro)" "(ToDesk Virtual Audio)" 这类才是真正区分设备的部分，必须留下。
+_BOILERPLATE_WORD_RE = re.compile(
+    r'high definition audio|display audio|realtek|usb audio|wave mapper|bluetooth audio',
+    re.IGNORECASE,
+)
+
+
+def _split_trailing_group(text):
+    """拆出末尾那个成对的括号组，返回 (括号前的内容, 括号组)；没有则返回 (text, None)
+
+    要处理嵌套："Speakers (Realtek(R) Audio)" 的末尾括号组是整段
+    "(Realtek(R) Audio)"，不是里面那个 "(R)"。
+    """
+    stripped = text.rstrip()
+    if not stripped.endswith(')'):
+        return text, None
+    close = len(stripped) - 1
+    depth = 0
+    for i in range(close, -1, -1):
+        if stripped[i] == ')':
+            depth += 1
+        elif stripped[i] == '(':
+            depth -= 1
+            if depth == 0:
+                return stripped[:i].rstrip(), stripped[i:]
+    return text, None
+
+
+def display_device_name(name):
+    """把设备名整理成适合下拉菜单显示的样子（只用于显示，不参与匹配）
+
+    设备列表走 MME，名字被系统截断到 31 字符，末尾常留下半个括号
+    （"Realtek HD Audio 2nd output (Re"），看着像坏了；再叠上驱动样板名就更乱。
+    这里把这两样都去掉，剩下的部分足够用户认出设备，同名设备靠索引区分。
+    """
+    original = clean_device_name(name)
+    text = original
+
+    # 1. 去掉末尾的驱动样板括号（可能叠了好几层，如 "... (Realtek(R) Audio)"）
+    while True:
+        head, group = _split_trailing_group(text)
+        if group is None or not _BOILERPLATE_WORD_RE.search(group):
+            break
+        text = head
+
+    # 2. 去掉末尾被截断的半个括号："... (Re" / "... (VB-Audio Virtual C"
+    open_index = text.rfind('(')
+    if open_index != -1 and text.find(')', open_index) == -1:
+        text = text[:open_index]
+
+    # 3. 万一整串都被去掉了（极端情况），保留原始名，别显示成空白
+    return text.strip() or original
+
+
 class AudioManager:
     def __init__(self):
         self.is_running = False
@@ -58,6 +159,9 @@ class AudioManager:
         self.stream = None
         self.pyaudio_instance = None
         self.detected_language = None  # 存储检测到的语言
+        # 语种检测是逐段做的，单段音频（1~7 秒）偶尔会判错，界面上就会看到
+        # "英语/德语"来回跳。这里对最近几段做个多数表决，让显示稳定下来。
+        self._language_votes = deque(maxlen=5)
         
         # 音频数据队列，用于从录音线程传递到播放线程
         self.playback_queue = queue.Queue(maxsize=1000)  # 限制队列大小以防内存占用过高
@@ -105,7 +209,33 @@ class AudioManager:
         self.last_voice_time = time.time()
         self.is_speaking = False
         self.silence_start = None
-        
+
+        # 输入音量监听（用于界面音量表）
+        self.input_volume = 0.0
+        self._input_volume_time = 0.0
+        self._volume_monitor_running = False
+        self._volume_monitor_thread = None
+        self._volume_monitor_index = None
+        self._volume_monitor_stream = None
+        # 监听代次：每次开关监听自增，旧线程凭此判断自己是否已被替换
+        self._volume_monitor_token = 0
+
+        # 输出（播放）音量（用于界面音量表）
+        self.output_volume = 0.0
+        self._output_volume_time = 0.0
+        # 播放失败时的原因（None 表示正常），界面据此提示"为什么没声音"
+        self.output_error = None
+        # 播放线程的停止信号（与 is_running 分离，便于运行中单独开关监听）
+        self._playback_stop_event = None
+        # 本次监听已成功写出的音频帧数（一直在涨就说明数据确实送进了设备）
+        self.playback_frames_written = 0
+        # 本次监听实际打开的设备和它的索引，供界面显示
+        self.monitor_device_name = None
+        self.monitor_device_index = None
+        # 最近一次"测试"音实际播放到的设备（界面用来显示"到底响在哪"）
+        self.test_tone_device = None
+        self.test_tone_index = None
+
         print("AudioManager初始化完成")
         
     def _init_pyaudio(self):
@@ -219,128 +349,124 @@ class AudioManager:
             return False
     
     def get_input_devices(self):
-        """获取系统上可用的音频输入设备列表"""
-        p = pyaudio.PyAudio()
-        devices = []
-        
-        try:
-            for i in range(p.get_device_count()):
-                try:
-                    device_info = p.get_device_info_by_index(i)
-                    if device_info['maxInputChannels'] > 0:
-                        # 处理设备名称可能的编码问题
-                        device_name = device_info['name']
-                        
-                        # 如果设备名称包含特殊字符或可能导致乱码的字符，尝试清理
-                        try:
-                            # 尝试解码/编码设备名称以验证其有效性
-                            if isinstance(device_name, bytes):
-                                device_name = device_name.decode('utf-8', errors='ignore')
-                            
-                            # 过滤掉一些已知问题的字符序列
-                            import re
-                            # 删除特殊控制字符
-                            device_name = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', device_name)
-                            # 删除一些常见的乱码标志
-                            device_name = re.sub(r'[\uFFFD\uFFFE\uFFFF]', '', device_name)
-                            
-                            # 如果设备名称中包含系统路径，这可能表明有问题
-                            if '@System32\\' in device_name or '\\??\\' in device_name:
-                                # 尝试提取一个更友好的名称
-                                friendly_parts = re.findall(r'#(\w+)$|%(\w+)|\\(\w+)\)', device_name)
-                                if friendly_parts:
-                                    # 使用找到的所有非空部分
-                                    friendly_name = ''.join([part for group in friendly_parts for part in group if part])
-                                    if friendly_name:
-                                        device_name = f"音频设备 {friendly_name}"
-                                    else:
-                                        device_name = f"音频设备 {i}"
-                                else:
-                                    device_name = f"音频设备 {i}"
-                            
-                            # 确保最终名称不为空
-                            if not device_name.strip():
-                                device_name = f"音频设备 {i}"
-                                
-                        except Exception as e:
-                            print(f"处理设备名称时出错: {str(e)}")
-                            device_name = f"音频设备 {i}"
-                        
-                        # 添加设备信息到列表
-                        devices.append(f"{device_name} (Index: {i})")
-                except Exception as e:
-                    print(f"获取设备 {i} 信息时出错: {str(e)}")
-                    devices.append(f"未知设备 {i} (Index: {i})")
-        except Exception as e:
-            print(f"枚举音频设备时出错: {str(e)}")
-        
-        p.terminate()
-        return devices
-    
+        """获取系统上可用的音频输入设备列表（返回 '名称 (Index: N)' 格式）
+
+        名字经过 display_device_name 整理，只为了让下拉框好看；匹配设备时用的是
+        原始名字（resolve_device_index 里的模糊匹配兼容两者）。
+        """
+        devices = self._enumerate_devices(want_input=True)
+        return [f"{display_device_name(name)} (Index: {index})" for name, index in devices]
+
     def get_output_devices(self):
-        """获取系统上可用的音频输出设备列表"""
+        """获取系统上可用的音频输出设备列表（返回 '名称 (Index: N)' 格式）"""
+        devices = self._enumerate_devices(want_input=False)
+        return [f"{display_device_name(name)} (Index: {index})" for name, index in devices]
+
+    def _enumerate_devices(self, want_input):
+        """
+        枚举音频设备。
+
+        采集和播放都统一用 MME——本机实测各主机 API 的表现：
+
+        - MME：可用——read() 会真正阻塞等待新采样，返回的是新鲜数据；支持 16kHz
+          （Whisper 所需的固定采样率），播放时由系统负责重采样到设备原生采样率。
+          缺点是设备名被截断到 31 字符。
+        - DirectSound：能打开、能写入、设备名完整，但本机送不出声音——实测向
+          DirectSound 设备写入 880Hz 测试音，用虚拟声卡回环采集到的峰值只有 1
+          （纯静音，正常应约 8000）；采集侧也同样失效：read() 不阻塞（实测读 8 次
+          仅耗时 0.000 秒，正常应为 0.512 秒），并把所有设备的旧缓冲区原样反复返回
+          （不同设备读到完全相同的数据），导致音量表在任何设备上都一直显示有信号。
+        - WASAPI：设备只接受原生采样率（44.1/48kHz），16kHz 打开报
+          -9997 Invalid sample rate。
+        - WDM-KS：打开报 -9999 Unanticipated host error，且名称为乱码。
+
+        因此两个方向都用 MME。代价是设备名被截断：名称相近的设备在列表里可能显示成
+        同一条（例如两台型号相同的显示器），需要靠"先单独测试再选定"来区分。
+
+        在单一主机 API 下不去重——每个物理设备只出现一次，而去重会误合并同名但实际
+        不同的设备（例如两个型号相同的显示器）。若首选主机 API 不可用或为空，则回退到
+        遍历全部主机 API 并按名称去重，以消除跨 API 的重复条目。
+        """
         p = pyaudio.PyAudio()
-        devices = []
-        
         try:
-            for i in range(p.get_device_count()):
-                try:
-                    device_info = p.get_device_info_by_index(i)
-                    if device_info['maxOutputChannels'] > 0:
-                        # 处理设备名称可能的编码问题
-                        device_name = device_info['name']
-                        
-                        # 如果设备名称包含特殊字符或可能导致乱码的字符，尝试清理
-                        try:
-                            # 尝试解码/编码设备名称以验证其有效性
-                            if isinstance(device_name, bytes):
-                                device_name = device_name.decode('utf-8', errors='ignore')
-                            
-                            # 过滤掉一些已知问题的字符序列
-                            import re
-                            # 删除特殊控制字符
-                            device_name = re.sub(r'[\x00-\x1F\x7F-\x9F]', '', device_name)
-                            # 删除一些常见的乱码标志
-                            device_name = re.sub(r'[\uFFFD\uFFFE\uFFFF]', '', device_name)
-                            
-                            # 如果设备名称中包含系统路径，这可能表明有问题
-                            if '@System32\\' in device_name or '\\??\\' in device_name:
-                                # 尝试提取一个更友好的名称
-                                friendly_parts = re.findall(r'#(\w+)$|%(\w+)|\\(\w+)\)', device_name)
-                                if friendly_parts:
-                                    # 使用找到的所有非空部分
-                                    friendly_name = ''.join([part for group in friendly_parts for part in group if part])
-                                    if friendly_name:
-                                        device_name = f"音频设备 {friendly_name}"
-                                    else:
-                                        device_name = f"音频设备 {i}"
-                                else:
-                                    device_name = f"音频设备 {i}"
-                            
-                            # 确保最终名称不为空
-                            if not device_name.strip():
-                                device_name = f"音频设备 {i}"
-                                
-                        except Exception as e:
-                            print(f"处理设备名称时出错: {str(e)}")
-                            device_name = f"音频设备 {i}"
-                        
-                        # 添加设备信息到列表
-                        devices.append(f"{device_name} (Index: {i})")
-                except Exception as e:
-                    print(f"获取设备 {i} 信息时出错: {str(e)}")
-                    devices.append(f"未知设备 {i} (Index: {i})")
-        except Exception as e:
-            print(f"枚举音频设备时出错: {str(e)}")
-        
-        p.terminate()
-        return devices
-    
+            wanted_host = 'MME'
+            preferred_host = None
+            try:
+                for h in range(p.get_host_api_count()):
+                    host_name = (p.get_host_api_info_by_index(h).get('name') or '').strip()
+                    if wanted_host.lower() in host_name.lower():
+                        preferred_host = h
+                        break
+            except Exception:
+                preferred_host = None
+
+            if preferred_host is not None:
+                items = self._collect_devices(p, want_input, host_filter=preferred_host, dedup=False)
+                if items:
+                    return items
+
+            return self._collect_devices(p, want_input, host_filter=None, dedup=True)
+        finally:
+            p.terminate()
+
+    def _collect_devices(self, p, want_input, host_filter, dedup):
+        """收集指定类型的音频设备，返回 [(名称, index), ...]，可选按名称去重"""
+        seen = set()
+        result = []
+        for i in range(p.get_device_count()):
+            try:
+                info = p.get_device_info_by_index(i)
+            except Exception:
+                continue
+
+            if host_filter is not None and info.get('hostApi') != host_filter:
+                continue
+
+            channels = info.get('maxInputChannels', 0) if want_input else info.get('maxOutputChannels', 0)
+            if channels <= 0:
+                continue
+
+            name = self._clean_device_name(info.get('name', ''))
+            if not name or self._is_pseudo_device(name):
+                continue
+
+            if dedup:
+                key = name.strip().lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+            result.append((name, i))
+
+        return result
+
+    def _clean_device_name(self, name):
+        """清理设备名称（见模块级 clean_device_name）"""
+        return clean_device_name(name)
+
+    def _is_pseudo_device(self, name):
+        """判断是否为伪设备（声音映射器 / 主声音驱动程序 / 无友好名的空端点）"""
+        lower = name.lower()
+        markers = (
+            '声音映射器', 'sound mapper',
+            '主声音捕获驱动程序', '主声音驱动程序',
+            'primary sound capture driver', 'primary sound driver',
+        )
+        for marker in markers:
+            if marker in lower:
+                return True
+        if name.endswith('()'):
+            return True
+        return False
+
     def start_recording(self, input_device, output_device=None):
         """开始录音并识别语音"""
         if self.is_running:
             return
-        
+
+        # 停止独立的音量监听线程，释放输入设备
+        self.stop_input_monitor()
+
         # 确保之前的资源已清理
         self._cleanup_pyaudio()
         
@@ -361,27 +487,17 @@ class AudioManager:
         self.audio_delay_enabled = config.get("audio_delay_enabled", False)
         self.audio_delay_ms = config.get("audio_delay_ms", 0) if self.audio_delay_enabled else 0
         
-        # 提取设备索引
+        # 提取设备索引（按名字重新匹配，不信任标签里的旧索引）
         try:
-            # 尝试从字符串中提取设备索引
-            import re
-            input_index_match = re.search(r'Index: (\d+)', input_device)
-            if input_index_match:
-                self.input_device_index = int(input_index_match.group(1))
-                print(f"使用输入设备索引: {self.input_device_index}")
+            self.input_device_index = self.resolve_device_index(input_device, want_input=True)
+            if self.input_device_index is None:
+                print(f"无法从'{input_device}'解析输入设备，使用默认设备")
             else:
-                print(f"无法从'{input_device}'提取输入设备索引，使用默认设备")
-                self.input_device_index = None
-            
-            # 处理输出设备索引
+                print(f"使用输入设备索引: {self.input_device_index}")
+
             if output_device:
-                output_index_match = re.search(r'Index: (\d+)', output_device)
-                if output_index_match:
-                    self.output_device_index = int(output_index_match.group(1))
-                    print(f"使用输出设备索引: {self.output_device_index}")
-                else:
-                    print(f"无法从'{output_device}'提取输出设备索引，不使用输出设备")
-                    self.output_device_index = None
+                self.output_device_index = self.resolve_device_index(output_device)
+                print(f"使用输出设备索引: {self.output_device_index}")
             else:
                 self.output_device_index = None
         except Exception as e:
@@ -403,15 +519,182 @@ class AudioManager:
         self.recognition_thread.start()
         
         # 如果启用了音频监听，则启动播放线程
-        if config.get("monitor_enabled", False) and output_device:
-            self.playback_thread = threading.Thread(target=self._playback_audio)
-            self.playback_thread.daemon = True
-            self.playback_thread.start()
-        
+        if config.get("monitor_enabled", False):
+            self.set_monitor_enabled(True)
+
         print(f"开始录音 - 输入设备: {input_device}, 输出设备: {output_device}")
         if self.audio_delay_enabled:
             print(f"音频延迟已启用: {self.audio_delay_ms} 毫秒")
-            
+
+    def set_monitor_enabled(self, enabled):
+        """开关"监听系统声音"（把采集到的音频送到输出设备）
+
+        运行中也能随时切换：勾选立即开始播放，取消立即停止，不必停机重启。
+        未运行时什么也不做，等 start_recording 按配置统一启动。
+        """
+        if not self.is_running:
+            return False
+        if enabled:
+            return self._start_playback()
+        self._stop_playback()
+        return True
+
+    def _start_playback(self):
+        """启动播放线程；已在播放则先停掉，确保按当前输出设备重新打开"""
+        if not self.is_running:
+            return False
+
+        self._stop_playback()
+
+        # 每次开播都按名字重新解析：设备列表可能已经变了，旧索引会指到别的设备
+        if self.output_device:
+            self.output_device_index = self.resolve_device_index(self.output_device)
+            self._warn_if_index_stale(self.output_device, self.output_device_index)
+
+        if self.output_device_index is None:
+            self.output_error = "没有选择输出设备"
+            print("监听已启用，但没有可用的输出设备，声音无法播放")
+            return False
+
+        # 丢掉上一轮残留的音频，避免重新开启时先蹦出旧声音
+        while True:
+            try:
+                self.playback_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.output_error = None
+        self.playback_frames_written = 0
+        self.monitor_device_index = self.output_device_index
+        self.monitor_device_name = self.describe_output_device(self.output_device_index)
+        stop_event = threading.Event()
+        self._playback_stop_event = stop_event
+        self.playback_thread = threading.Thread(
+            target=self._playback_audio, args=(stop_event,),
+            name="audio-playback", daemon=True
+        )
+        self.playback_thread.start()
+        return True
+
+    def _stop_playback(self):
+        """停止播放线程并归零输出音量表"""
+        stop_event = self._playback_stop_event
+        if stop_event is not None:
+            stop_event.set()
+        self._playback_stop_event = None
+
+        thread = self.playback_thread
+        self.playback_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                print("警告: 播放线程未能在 1 秒内结束")
+
+        self.output_volume = 0.0
+        self._output_volume_time = 0.0
+
+    def get_output_error(self):
+        """返回最近一次播放失败的原因，正常时为 None"""
+        return self.output_error
+
+    def describe_output_device(self, index):
+        """按索引查设备名（用于界面显示"正在往哪个设备放"），查不到返回 None
+
+        注意：索引在每次运行/插拔后都可能变，这里只是把即将打开的那个索引翻成名字，
+        查到的名字仅用于显示和排查，不参与设备选择。
+        """
+        if index is None:
+            return None
+        try:
+            if self.pyaudio_instance is None:
+                self._init_pyaudio()
+            info = self.pyaudio_instance.get_device_info_by_index(int(index))
+            return clean_device_name(info.get("name") or "")
+        except Exception:
+            return None
+
+    def get_monitor_device_name(self):
+        """返回本次监听实际打开的设备名（未监听时为 None）"""
+        return self.monitor_device_name
+
+    def get_monitor_device_index(self):
+        """返回本次监听实际打开的设备索引（未监听时为 None）"""
+        return self.monitor_device_index
+
+    def get_playback_frames_written(self):
+        """返回本次监听已成功写出的音频帧数"""
+        return self.playback_frames_written
+
+    def set_output_device(self, output_device):
+        """切换输出设备；正在监听时立刻用新设备重开输出流"""
+        self.output_device = output_device
+        self.output_device_index = self.resolve_device_index(output_device)
+        if self.is_running and config.get("monitor_enabled", False):
+            self.set_monitor_enabled(True)
+
+    def play_test_tone(self, output_device, seconds=0.6):
+        """向指定输出设备播放一小段测试音，用于确认监听是否真的出声
+
+        先同步打开输出流（失败要立刻告诉用户），再在后台线程里写数据播放，
+        避免界面卡顿。返回 (是否打开成功, 错误信息)。
+        """
+        index = self.resolve_device_index(output_device)
+
+        p = pyaudio.PyAudio()
+        try:
+            stream = p.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=self.sample_rate,
+                output=True,
+                frames_per_buffer=self.chunk_size,
+                output_device_index=index
+            )
+        except Exception as e:
+            p.terminate()
+            message = f"无法打开输出设备: {e}"
+            print(f"测试音播放失败 - {message}")
+            self.output_error = message
+            return False, message
+
+        # 界面标签里的索引可能是旧的，实际打开的是这个索引/设备，报给用户看
+        actual_name = None
+        try:
+            actual_name = clean_device_name(
+                p.get_device_info_by_index(index)['name']) if index is not None else '系统默认输出设备'
+        except Exception:
+            actual_name = None
+        self.test_tone_device = actual_name
+        self.test_tone_index = index
+
+        def _play():
+            try:
+                # 两个短促的提示音，比单音更容易分辨
+                t = np.arange(int(self.sample_rate * seconds)) / self.sample_rate
+                tone = (0.25 * 32767 * np.sin(2 * np.pi * 880 * t)).astype(np.int16).tobytes()
+                silence = bytes(int(self.sample_rate * 0.15) * 2)
+                for _ in range(2):
+                    stream.write(tone)
+                    stream.write(silence)
+                # 等缓冲区放完再关，避免把最后一段声音掐掉
+                time.sleep(0.2)
+                self.output_error = None
+                print(f"测试音已播放到输出设备: {actual_name or output_device or '默认设备'}"
+                      f"（索引 {index}，界面标签是「{output_device}」）")
+            except Exception as e:
+                self.output_error = f"写入输出设备失败: {e}"
+                print(f"测试音播放失败 - {self.output_error}")
+            finally:
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception:
+                    pass
+                p.terminate()
+
+        threading.Thread(target=_play, name="output-test-tone", daemon=True).start()
+        return True, None
+
     def stop_recording(self):
         """停止录音和识别"""
         if not self.is_running:
@@ -420,12 +703,15 @@ class AudioManager:
             
         print("开始停止录音和识别...")
         self.is_running = False
-        
+
+        # 先单独停播放线程（它有自己的停止信号），再统一 join
+        self._stop_playback()
+
         # 停止字幕记录
         self.subtitle_manager.stop_recording()
-        
+
         # 等待线程结束
-        for thread in [self.recording_thread, self.recognition_thread, self.playback_thread]:
+        for thread in [self.recording_thread, self.recognition_thread]:
             if thread and thread.is_alive():
                 try:
                     print(f"等待线程 {thread.name} 结束...")
@@ -445,7 +731,13 @@ class AudioManager:
         
         # 清理资源
         self._cleanup_pyaudio()
-        
+
+        # 归零音量表，避免停止后界面仍显示有信号
+        self.input_volume = 0.0
+        self._input_volume_time = 0.0
+        self.output_volume = 0.0
+        self._output_volume_time = 0.0
+
         print("录音和识别已完全停止")
             
     def _record_audio(self):
@@ -495,23 +787,47 @@ class AudioManager:
             last_progress_time = time.time()
             
             # 语音分段参数
-            max_record_seconds = 5.0  # 最大录音时长，无论是否检测到停顿都会在这个时间后提交
-            min_record_seconds = 1.0  # 最小录音时长，至少需要有这么长的有效语音才考虑提交
-            
+            max_record_seconds = 7.0  # 最长一段音频，超过就强制切（Whisper 的窗口是 30 秒）
+            min_record_seconds = 1.0  # 一段至少要有这么长才值得送去识别
+
             # 静音检测参数
-            silence_threshold = 100  # 静音检测阈值
-            silence_duration_for_break = 0.5  # 连续检测到这个时长的静音后认为句子结束
-            required_silence_frames = int(self.sample_rate / self.chunk_size * silence_duration_for_break)  # 需要连续多少帧静音才算句子结束
-            
-            # 音频缓冲区大小限制
-            max_recognition_buffer_items = 30  # 增加缓冲区大小，防止内存泄漏但允许更长录音
-            
+            silence_duration_for_break = 0.5  # 连续静音超过这个时长就认为一句话说完了
+            required_silence_frames = max(1, int(self.sample_rate / self.chunk_size * silence_duration_for_break))
+
+            # 音频缓冲区大小限制。注意必须覆盖 max_record_seconds，否则缓冲区会先被
+            # 这里的"防内存泄漏"逻辑从头部裁掉：原来写死 30 帧（0.064 秒/帧）只能存
+            # 1.92 秒，于是 max_record_seconds=5 永远不可能触发，每次提交给 Whisper
+            # 的都只有最近 1.9 秒的音频——前面说的话被整段丢掉，这才是识别不准的主因。
+            max_recognition_buffer_items = int(
+                max_record_seconds * self.sample_rate / self.chunk_size) + 10
+
+            # 噪声底噪估计：用最近若干帧峰值的低分位数动态估计，而不是写死一个
+            # 绝对阈值。写死的话（原来是 100，只有满量程的 0.3%）：
+            #   - 真实麦克风的底噪通常就有一两百，会被当成"一直在说话"，
+            #     静音帧永远清零，句子结束永远不触发，只能在超时处被硬切在词中间；
+            #   - 虚拟声卡（VB-Cable 之类）底噪是数字零，阈值又完全够用。
+            # 用低分位数就能同时适应这两种情况。
+            noise_reference = deque(maxlen=150)  # 约 9.6 秒
+            noise_floor = 0.0
+            min_noise_floor = 150  # 底噪下限，避免在绝对安静时阈值退化成 0
+            noise_ratio = 3.0     # 超过底噪这么多倍才算有人说话
+            # 打开音频流后的前几帧是未初始化的（实测第一帧峰值可到 7827，之后都是 1），
+            # 直接丢弃，否则会被当成"检测到语音"，接着 0.5 秒静音就判成一句话结束，
+            # 把一段几乎全静的音频送进 Whisper 触发幻觉。
+            warmup_frames = 5
+
+            # 说话起始需要连续多少帧超过阈值才算数（滤掉单个脉冲）
+            onset_frames_needed = 2
+            onset_frames = 0
+
             # 是否有足够音量的标志
             has_sufficient_volume = False
-            
+
             # 静音检测参数
             silence_frames = 0
             speech_detected = False  # 是否已检测到语音开始
+            # 本段中"有语音"的帧数，用于判断这段音频是否值得送去识别
+            voiced_frames_in_segment = 0
             
             while self.is_running:
                 try:
@@ -537,19 +853,39 @@ class AudioManager:
                     
                     # 检查是否为信号报告的数字单词序列
                     audio_array = np.frombuffer(audio_data, dtype=np.int16)
-                    
-                    # 检查音频音量是否超过阈值
-                    current_volume = np.max(np.abs(audio_array))
-                    
+
+                    # 更新输入音量（用于界面音量表）
+                    self._update_input_volume(self.meter_level(audio_data))
+
+                    # 丢弃流刚打开时的未初始化数据（同时用它初始化底噪参考）
+                    if frame_count <= warmup_frames:
+                        continue
+
+                    # 本帧峰值（int16 量纲）
+                    current_volume = int(np.max(np.abs(audio_array)))
+
+                    # 用低分位数（约 15%）估计噪声底噪：语音只占一小部分时间，
+                    # 低分位数基本落在纯噪声帧上。
+                    noise_reference.append(float(current_volume))
+                    if len(noise_reference) >= 20:
+                        sorted_ref = sorted(noise_reference)
+                        noise_floor = sorted_ref[max(0, int(len(sorted_ref) * 0.15) - 1)]
+
+                    speech_threshold = max(noise_floor * noise_ratio, min_noise_floor)
+                    is_silent = current_volume <= speech_threshold
+
                     # 检测静音/语音
-                    is_silent = current_volume <= silence_threshold
                     if not is_silent:  # 检测到声音
-                        if not speech_detected:
-                            print(f"检测到语音开始，音量: {current_volume}")
+                        onset_frames += 1
+                        if not speech_detected and onset_frames >= onset_frames_needed:
+                            print(f"检测到语音开始，音量: {current_volume}, 判定阈值: {speech_threshold:.0f}, 底噪: {noise_floor:.0f}")
                             speech_detected = True
-                        silence_frames = 0  # 重置静音计数
-                        has_sufficient_volume = True
+                        if speech_detected:
+                            silence_frames = 0  # 重置静音计数
+                            has_sufficient_volume = True
+                            voiced_frames_in_segment += 1
                     else:  # 检测到静音
+                        onset_frames = 0
                         if speech_detected:  # 只有在已经检测到语音的情况下才累计静音
                             silence_frames += 1
                             if DEBUG_MODE and silence_frames % 10 == 0:
@@ -572,89 +908,98 @@ class AudioManager:
                     recognition_buffer.append(audio_float)
                     recognition_buffer_duration += self.chunk_size / self.sample_rate
                     
-                    # 限制识别缓冲区大小，防止内存泄漏
-                    if len(recognition_buffer) > max_recognition_buffer_items:
-                        # 移除最早的数据，保留缓冲区大小
+                    # 限制识别缓冲区大小，防止内存泄漏（正常情况下不会触发，
+                    # 因为一旦达到 max_record_seconds 就会被提交）
+                    while len(recognition_buffer) > max_recognition_buffer_items:
                         removed_duration = len(recognition_buffer[0]) / self.sample_rate
                         recognition_buffer.pop(0)
                         recognition_buffer_duration -= removed_duration
                         if DEBUG_MODE and frame_count % 500 == 0:
                             print(f"缓冲区过大，已移除最早的 {removed_duration:.2f} 秒数据")
-                    
+
                     # 判断是否需要提交音频进行处理的条件:
                     # 1. 缓冲区达到最大时长限制 - 强制提交
                     max_duration_reached = recognition_buffer_duration >= max_record_seconds
-                    
+
                     # 2. 检测到足够长的语音后接一个停顿 - 自然句子结束
-                    sentence_end_detected = (speech_detected and 
-                                            recognition_buffer_duration >= min_record_seconds and 
+                    sentence_end_detected = (speech_detected and
+                                            recognition_buffer_duration >= min_record_seconds and
                                             silence_frames >= required_silence_frames)
-                    
-                    # 3. 超时强制提交 - 避免长时间没有提交
+
+                    # 3. 兜底：连续说了很久都没有停顿（比如现场噪声一直高于阈值），
+                    #    至少每 4 秒交一次，避免字幕长时间不更新
                     current_time = time.time()
                     time_since_last_submission = current_time - last_submission_time
-                    force_submit = has_sufficient_volume and recognition_buffer_duration >= min_record_seconds and time_since_last_submission > 3.0
-                    
+                    stalled_submit = (has_sufficient_volume and
+                                      recognition_buffer_duration >= 4.0 and
+                                      time_since_last_submission > 4.0)
+
                     # 每300帧打印一次分段状态
                     if speech_detected and frame_count % 300 == 0:
-                        print(f"语音分段状态: 缓冲区={recognition_buffer_duration:.2f}秒, 连续静音={silence_frames}帧/{required_silence_frames}帧, 最大时长达到={max_duration_reached}, 句子结束={sentence_end_detected}, 强制提交={force_submit}")
-                    
+                        print(f"语音分段状态: 缓冲区={recognition_buffer_duration:.2f}秒, 连续静音={silence_frames}帧/{required_silence_frames}帧, 最大时长达到={max_duration_reached}, 句子结束={sentence_end_detected}, 兜底提交={stalled_submit}")
+
                     # 根据上述条件决定是否提交音频
-                    if max_duration_reached or sentence_end_detected or force_submit:
+                    if max_duration_reached or sentence_end_detected or stalled_submit:
                         # 合并音频数据
                         recognition_data = np.concatenate(recognition_buffer)
-                        
-                        # 打印音频信息
+
                         audio_length_sec = len(recognition_data) / self.sample_rate
-                        audio_max_volume = np.max(np.abs(recognition_data))
-                        print(f"准备处理音频段: 长度={audio_length_sec:.2f}秒, 最大音量={audio_max_volume:.4f}, 有效信号={has_sufficient_volume}")
-                        
-                        # 如果音频没有足够的音量或过短，可能跳过处理
-                        if len(recognition_data) < 0.3 * self.sample_rate:  # 小于0.3秒
-                            print(f"音频片段过短 ({len(recognition_data)/self.sample_rate:.2f}秒)，跳过处理")
-                        elif np.max(np.abs(recognition_data)) < 0.01:  # 音量极小
-                            print(f"音频片段音量太小 ({np.max(np.abs(recognition_data)):.4f})，跳过处理")
+                        audio_max_volume = float(np.max(np.abs(recognition_data)))
+                        # 用整段 RMS 判断"有没有人说话"，而不是峰值：
+                        # 峰值会被单个脉冲（例如流打开时的爆音）带过去，
+                        # 于是一段几乎全静的音频也被送去识别并触发幻觉。
+                        audio_rms = float(np.sqrt(np.mean(np.square(recognition_data))))
+                        print(f"准备处理音频段: 长度={audio_length_sec:.2f}秒, 峰值={audio_max_volume:.4f}, "
+                              f"RMS={audio_rms:.5f}, 有语音帧数={voiced_frames_in_segment}")
+
+                        submitted = False
+                        if not has_sufficient_volume or voiced_frames_in_segment < 2:
+                            # 整段都没检测到语音：直接丢弃，不送识别。
+                            # 这类音频交给 Whisper 只会换来幻觉文本。
+                            print(f"音频片段内未检测到语音，丢弃 ({audio_length_sec:.2f}秒)")
+                            submitted = True  # 已经"处理"过了，需要清空缓冲区
+                        elif audio_rms < 0.0015:
+                            # RMS 太低说明基本是噪声底噪，识别出来也没意义
+                            print(f"音频片段 RMS 过低 ({audio_rms:.5f})，丢弃")
+                            submitted = True
                         else:
-                            # 将音频数据放入识别队列 - 直接传递NumPy数组，而不是字节
                             try:
                                 # 队列大小限制，避免堆积太多待处理任务
-                                if self.audio_queue.qsize() < 5:  # 增加允许的待处理任务数量
-                                    print(f"提交音频段到识别队列: 长度={audio_length_sec:.2f}秒, 队列大小={self.audio_queue.qsize()}, 最大音量={audio_max_volume:.4f}")
+                                if self.audio_queue.qsize() < 5:
+                                    print(f"提交音频段到识别队列: 长度={audio_length_sec:.2f}秒, 队列大小={self.audio_queue.qsize()}, 峰值={audio_max_volume:.4f}")
                                     self.audio_queue.put((recognition_data, time.time()))
-                                    
-                                    # 重置缓冲区和状态
-                                    recognition_buffer = []
-                                    recognition_buffer_duration = 0
-                                    has_sufficient_volume = False  # 重置音量标志
-                                    silence_frames = 0  # 重置静音计数
-                                    speech_detected = False  # 重置语音检测状态
-                                    
-                                    # 记录提交时间
+                                    submitted = True
                                     last_submission_time = time.time()
-                                    print(f"音频数据已提交，缓冲区已重置")
                                 else:
-                                    print(f"识别队列已满({self.audio_queue.qsize()}), 跳过此次处理")
-                            except queue.Full:
-                                print("识别队列已满，跳过此次处理")
-                        
-                        # 清空缓冲区，但保留最后0.2秒的数据，减少延迟
-                        overlap_samples = int(0.2 * self.sample_rate)
-                        if len(recognition_buffer) > 0 and len(recognition_buffer[-1]) >= overlap_samples:
-                            # 保留最后一个块的部分数据
-                            last_chunk = recognition_buffer[-1]
-                            recognition_buffer = [last_chunk[-overlap_samples:]]
-                            recognition_buffer_duration = overlap_samples / self.sample_rate
-                        else:
-                            # 如果最后的块太小，保留整个最后块
-                            if len(recognition_buffer) > 0:
-                                recognition_buffer = [recognition_buffer[-1]]
-                                recognition_buffer_duration = len(recognition_buffer[-1]) / self.sample_rate
-                            else:
-                                recognition_buffer = []
-                                recognition_buffer_duration = 0
-                        
-                        # 重置音量检测标志
-                        has_sufficient_volume = False
+                                    # 队列已满说明识别跟不上：丢弃最旧的一段，保证最新的
+                                    # 语音一定能进去（旧代码在这里直接跳过，而且下面还会把
+                                    # 缓冲区清空，等于白白丢掉一段语音）
+                                    try:
+                                        dropped, _ = self.audio_queue.get_nowait()
+                                        self.audio_queue.task_done()
+                                        print(f"识别队列已满，丢弃最旧的一段({len(dropped)/self.sample_rate:.2f}秒)后提交")
+                                    except queue.Empty:
+                                        pass
+                                    self.audio_queue.put((recognition_data, time.time()))
+                                    submitted = True
+                                    last_submission_time = time.time()
+                            except Exception as e:
+                                print(f"提交音频段失败: {str(e)}")
+
+                        if submitted:
+                            # 只有真正处理过这段音频才清空缓冲区。
+                            # 旧代码不管有没有提交都清空，还只保留 0.2 秒重叠——
+                            # 既把被判"太短/太轻"的语音整段丢掉，又因为重叠部分
+                            # 没有去重而制造重复词（实测词错率 10.4% → 14.6%）。
+                            recognition_buffer = []
+                            recognition_buffer_duration = 0
+                            silence_frames = 0
+                            speech_detected = False
+                            onset_frames = 0
+                            voiced_frames_in_segment = 0
+                            has_sufficient_volume = False
+                            print("音频段处理完毕，缓冲区已重置")
+
                     
                 except Exception as e:
                     print(f"处理音频数据时出错: {str(e)}")
@@ -678,22 +1023,23 @@ class AudioManager:
             
             print("录音线程已结束")
             
-    def _playback_audio(self):
+    def _playback_audio(self, stop_event=None):
         """专门的音频播放线程 - 只负责播放音频，与识别完全分离"""
         try:
             # 获取延迟设置
             delay_enabled = config.get("audio_delay_enabled", False)
             delay_ms = config.get("audio_delay_ms", 0)
-            
+
             # 创建输出流
             try:
                 # 如果PyAudio实例不存在，初始化它
                 if self.pyaudio_instance is None:
                     self._init_pyaudio()
                     if self.pyaudio_instance is None:
+                        self.output_error = "PyAudio 实例初始化失败"
                         print("无法创建音频输出流：PyAudio实例初始化失败")
                         return
-                
+
                 # 创建输出流
                 output_stream = self.pyaudio_instance.open(
                     format=pyaudio.paInt16,
@@ -703,14 +1049,21 @@ class AudioManager:
                     frames_per_buffer=self.chunk_size,
                     output_device_index=self.output_device_index if hasattr(self, 'output_device_index') else None
                 )
-                
-                print(f"音频输出流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}")
+
+                # 记下真正打开的设备名，界面上直接显示，避免"以为在放耳机其实在放显示器"
+                self.monitor_device_index = self.output_device_index
+                self.monitor_device_name = self.describe_output_device(self.output_device_index)
+
+                print(f"音频输出流创建成功: 采样率={self.sample_rate}, 通道数={self.channels}, "
+                      f"设备索引={self.output_device_index}, 设备名={self.monitor_device_name}")
             except Exception as e:
+                self.output_error = f"无法打开输出设备: {e}"
                 print(f"创建音频输出流失败: {str(e)}")
                 return
-            
+
             # 延迟缓冲区
             delay_buffer = deque(maxlen=10000)  # 足够大的缓冲区
+            last_error_log_time = 0.0  # 播放出错时限制日志频率
             
             # 如果启用延迟，计算延迟帧数并预填充缓冲区
             delay_frames = 0
@@ -724,8 +1077,8 @@ class AudioManager:
                     delay_buffer.append(silent_frame)
                 print(f"播放线程: 已预填充 {delay_frames} 帧静音数据")
             
-            # 播放循环
-            while self.is_running:
+            # 播放循环：is_running 表示整体在录音，stop_event 表示监听被单独关掉
+            while self.is_running and not (stop_event is not None and stop_event.is_set()):
                 try:
                     # 从队列获取音频数据（最多等待0.1秒）
                     try:
@@ -741,8 +1094,9 @@ class AudioManager:
                                     output_stream.write(delay_buffer.popleft())
                             else:
                                 output_stream.write(silent_frame)
+                        self._update_output_volume(0.0)
                         continue
-                    
+
                     # 延迟播放逻辑
                     if delay_enabled and delay_ms > 0:
                         # 将新数据添加到延迟缓冲区
@@ -753,12 +1107,25 @@ class AudioManager:
                     else:
                         # 直接播放，无延迟
                         output_stream.write(audio_data)
-                    
+
+                    # 写成功之后才更新音量表——这样音量表反映的是真正写进输出设备的
+                    # 数据，不会出现"音量表在动但耳机没声音"的误导
+                    self._update_output_volume(self.meter_level(audio_data))
+                    self.output_error = None
+                    # 计数：一直在涨说明数据确实在往设备里送
+                    self.playback_frames_written += 1
+
                     # 标记此任务完成
                     self.playback_queue.task_done()
-                    
+
                 except Exception as e:
-                    print(f"播放音频时出错: {str(e)}")
+                    # 播放失败要让用户知道：音量表归零并在界面上提示原因
+                    self.output_error = f"播放失败: {e}"
+                    self._update_output_volume(0.0)
+                    now = time.time()
+                    if now - last_error_log_time > 5.0:
+                        last_error_log_time = now
+                        print(f"播放音频时出错: {str(e)}")
                     time.sleep(0.01)  # 防止错误循环消耗CPU
             
         except Exception as e:
@@ -774,7 +1141,10 @@ class AudioManager:
                     output_stream.close()
                 except Exception as e:
                     print(f"关闭音频输出流时出错: {str(e)}")
-            
+
+            # 线程结束（停止翻译或单独关掉监听）后音量表归零
+            self.output_volume = 0.0
+            self._output_volume_time = 0.0
             print("音频播放线程已结束")
             
     def _recognize_audio(self):
@@ -889,6 +1259,8 @@ class AudioManager:
                             
                             # 保存检测到的语言代码
                             self.detected_language = detected_language
+                            if detected_language and detected_language != "unknown":
+                                self._language_votes.append(detected_language)
                             
                             if DEBUG_MODE:
                                 print(f"检测到语言: {detected_language}, 文本: {text[:50] if text else '无'}")
@@ -966,26 +1338,298 @@ class AudioManager:
                     pass
     
     def get_latest_text(self):
-        """获取最新识别的文本"""
-        # 打印当前队列状态
-        print(f"当前文本队列长度: {len(self.text_queue)}")
-        
+        """获取最新识别的文本
+
+        这个方法现在被界面以 200ms 的节奏轮询，所以日志要按 DEBUG_MODE 控制，
+        否则控制台每秒刷 5 次"文本队列长度"。
+        """
         if not self.text_queue:
-            print("警告: 文本队列为空，返回None")
+            if DEBUG_MODE:
+                print("文本队列为空，返回 None")
             return None
-        
+
         # 返回最新一条文本
         latest_text = self.text_queue[-1]
-        print(f"从文本队列获取最新文本: '{latest_text[:30]}...'")
+        if DEBUG_MODE:
+            print(f"从文本队列获取最新文本: '{latest_text[:30]}...'")
         return latest_text
         
     def get_detected_language(self):
-        """获取检测到的语言代码"""
+        """获取检测到的语言代码
+
+        返回最近几段的多数表决结果，避免逐段检测偶发判错时界面上的语言标签乱跳。
+        """
+        if self._language_votes:
+            return max(set(self._language_votes), key=self._language_votes.count)
         return self.detected_language
         
     def get_recognition_delay(self):
         """获取语音识别的延迟（毫秒）"""
         return self.recognition_delay
+
+    def get_input_volume(self):
+        """获取当前输入音量（0.0~1.0，用于界面音量表）"""
+        # 超过 0.5 秒没有新的采样数据（监听/录音已停止或设备无数据）就归零，
+        # 避免音量表停留在旧值上一直显示"有信号"
+        if time.time() - self._input_volume_time > 0.5:
+            return 0.0
+        return self.input_volume
+
+    def get_output_volume(self):
+        """获取当前输出（播放）音量（0.0~1.0，用于界面音量表）"""
+        if time.time() - self._output_volume_time > 0.5:
+            return 0.0
+        return self.output_volume
+
+    def _update_input_volume(self, peak):
+        """更新输入音量：快速上升、缓慢下降，呈现平滑的 VU 表效果"""
+        self._input_volume_time = time.time()
+        if peak > self.input_volume:
+            self.input_volume = min(peak, 1.0)
+        else:
+            self.input_volume = max(0.0, self.input_volume * 0.9)
+
+    def _update_output_volume(self, peak):
+        """更新输出（播放）音量：快速上升、缓慢下降，呈现平滑的 VU 表效果"""
+        self._output_volume_time = time.time()
+        if peak > self.output_volume:
+            self.output_volume = min(peak, 1.0)
+        else:
+            self.output_volume = max(0.0, self.output_volume * 0.9)
+
+    @staticmethod
+    def meter_level(data):
+        """由原始 PCM 数据计算音量表电平（0.0~1.0）。
+
+        先去掉直流分量再取 RMS，而不是直接取绝对值峰值：DirectSound 等驱动在
+        音频流刚打开时返回的首批数据是未初始化的，带有明显的直流偏置甚至满量程
+        的孤立采样。若按峰值计算，音量表会在每次打开流（例如切换设备）时瞬间冲
+        到满格，看起来"选哪个设备都有信号"。
+        """
+        arr = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+        if arr.size == 0:
+            return 0.0
+        arr = arr - arr.mean()
+        rms = float(np.sqrt(np.mean(arr * arr))) / 32768.0
+        # RMS 数值偏小，乘 2 后更接近听感上的响度
+        return min(rms * 2.0, 1.0)
+
+    def _parse_device_index(self, device):
+        """从 '名称 (Index: N)' 字符串中解析设备索引"""
+        m = re.search(r'Index: (\d+)', device or '')
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def _device_label_to_name(device):
+        """把 '耳机 (AirPods Pro) (Index: 22)' 还原成设备名 '耳机 (AirPods Pro)'"""
+        return re.sub(r'\s*\(Index:\s*\d+\)\s*$', '', device or '').strip()
+
+    @staticmethod
+    def _device_name_key(name):
+        """设备名归一化，便于比较（忽略大小写和多余空白）"""
+        return re.sub(r'\s+', ' ', (name or '')).strip().lower()
+
+    def resolve_device_index(self, device, want_input=False):
+        """把界面上的设备标签解析成"此刻真的有效"的设备索引。
+
+        标签里的 Index 只是生成设备列表那一刻的快照：插拔耳机、蓝牙连上/断开、
+        虚拟声卡启停，都会让后面所有设备的索引整体错位。实测插一次蓝牙耳机，
+        同一个索引就会从"耳机"变成"显示器"。所以这里一律按设备名重新枚举匹配，
+        只有名字也找不到时才退回标签里的旧索引。
+        """
+        if not device:
+            return None
+
+        want_key = self._device_name_key(self._device_label_to_name(device))
+        if not want_key:
+            return self._parse_device_index(device)
+
+        try:
+            if self.pyaudio_instance is None:
+                self._init_pyaudio()
+            if self.pyaudio_instance is not None:
+                # 和界面列表用同一个主机 API（两个方向都是 MME），否则同名设备可能
+                # 匹配到另一个 API 的条目，索引含义就和界面不一致了。
+                # 这里按名字找 MME 的序号，而不是写死 0——主机 API 的顺序由 PortAudio
+                # 决定，写死会在别的机器上匹配错。
+                wanted_host = None
+                for h in range(self.pyaudio_instance.get_host_api_count()):
+                    host_name = (self.pyaudio_instance.get_host_api_info_by_index(h).get('name') or '')
+                    if 'mme' in host_name.lower():
+                        wanted_host = h
+                        break
+                exact, fuzzy = [], []
+                for i in range(self.pyaudio_instance.get_device_count()):
+                    info = self.pyaudio_instance.get_device_info_by_index(i)
+                    channel_key = 'maxInputChannels' if want_input else 'maxOutputChannels'
+                    if info.get(channel_key, 0) <= 0:
+                        continue
+                    name_key = self._device_name_key(clean_device_name(info.get('name') or ''))
+                    host_api = info.get('hostApi')
+                    if name_key == want_key:
+                        exact.append((host_api, i))
+                    elif want_key in name_key or name_key in want_key:
+                        fuzzy.append((host_api, i))
+                # 自己用的主机 API 下的同名条目（名字可能完整、也可能被截断，
+                # 所以精确和模糊两组都要看）。不能只看精确匹配那一组就返回：MME 把
+                # 名字截断到 31 字符，完整名反而只存在于 DirectSound 条目里，先看
+                # exact 会挑中那个送不出声音的 API。
+                preferred = [i for candidates in (exact, fuzzy)
+                             for host_api, i in candidates if host_api == wanted_host]
+
+                # 名字一模一样的设备（两台同型号显示器在列表里显示成同一条）只能靠
+                # 标签里的索引区分。索引虽然会变，但"那个索引现在仍指向一台同名设备"
+                # 就说明它还没错位，用它——否则选有音箱的那台、声音会跑到没音箱的
+                # 那台去，而且完全没提示。
+                label_index = self._parse_device_index(device)
+                if label_index is not None and label_index in preferred:
+                    return label_index
+                if preferred:
+                    return preferred[0]
+
+                # 自己用的接口下没有同名条目，才退回别的接口
+                for candidates in (exact, fuzzy):
+                    if candidates:
+                        return candidates[0][1]
+        except Exception as e:
+            print(f"按名字匹配设备时出错（退回标签里的索引）: {e}")
+
+        index = self._parse_device_index(device)
+        if index is not None:
+            print(f"警告: 找不到名为'{self._device_label_to_name(device)}'的设备，"
+                  f"退回标签里的索引 {index}（可能已经指向别的设备）")
+        return index
+
+    def _warn_if_index_stale(self, device, resolved):
+        """标签里的索引和实际解析出来的不一致时提醒一下（设备列表变过）"""
+        label_index = self._parse_device_index(device)
+        if resolved is not None and label_index is not None and label_index != resolved:
+            print(f"提示: 「{self._device_label_to_name(device)}」在列表里的旧索引是 {label_index}，"
+                  f"设备已变动，实际使用索引 {resolved}")
+
+    def start_input_monitor(self, input_device):
+        """开启独立的输入音量监听线程（不进行识别，仅供音量表显示）"""
+        if self.is_running:
+            return
+        index = self.resolve_device_index(input_device, want_input=True)
+        if index is None:
+            self.stop_input_monitor()
+            return
+        if self._volume_monitor_running and self._volume_monitor_index == index:
+            return
+        self.stop_input_monitor()
+
+        if self.pyaudio_instance is None:
+            self._init_pyaudio()
+        if self.pyaudio_instance is None:
+            return
+
+        # 优先用录音所用的采样率，这样音量表反映的就是识别时的真实电平；
+        # 设备不支持时再退回它自己的默认采样率（否则会 -9997 Invalid sample rate）。
+        rates = [self.sample_rate]
+        try:
+            info = self.pyaudio_instance.get_device_info_by_index(index)
+            default_rate = info.get('defaultSampleRate')
+            if default_rate and int(default_rate) not in rates:
+                rates.append(int(default_rate))
+        except Exception:
+            pass
+        if 44100 not in rates:
+            rates.append(44100)
+
+        stream = None
+        last_error = None
+        opened_rate = self.sample_rate
+        for rate in rates:
+            try:
+                stream = self.pyaudio_instance.open(
+                    format=pyaudio.paInt16,
+                    channels=self.channels,
+                    rate=rate,
+                    input=True,
+                    frames_per_buffer=self.chunk_size,
+                    input_device_index=index,
+                )
+                opened_rate = rate
+                break
+            except Exception as e:
+                last_error = e
+        if stream is None:
+            print(f"开启音量监听失败: {last_error}")
+            return
+
+        self._volume_monitor_index = index
+        self._volume_monitor_running = True
+        self._volume_monitor_stream = stream
+        self._volume_monitor_token += 1
+        token = self._volume_monitor_token
+        self._volume_monitor_thread = threading.Thread(
+            target=self._volume_monitor_loop, args=(stream, token, opened_rate),
+            name="input-volume-monitor", daemon=True
+        )
+        self._volume_monitor_thread.start()
+
+    def _volume_monitor_loop(self, stream, token, rate):
+        """音量监听线程：持续读取输入并更新音量"""
+        try:
+            # 丢弃流刚打开时的数据：驱动尚未填充真实采样，读到的是带直流偏置的
+            # 垃圾数据，会让音量表一开始就冲到满格（切换设备时尤其明显）
+            discard_until = time.time() + 0.15
+            chunk_seconds = self.chunk_size / float(rate or self.sample_rate)
+            last_data = None
+            # 用代次 token 而不是全局开关判断退出：全局开关在切换设备时会被
+            # 立刻重新置 True，会让尚未退出的旧线程继续从旧设备读数
+            while self._volume_monitor_token == token:
+                started = time.time()
+                try:
+                    data = stream.read(self.chunk_size, exception_on_overflow=False)
+                except Exception:
+                    break
+                if self._volume_monitor_token != token:
+                    break
+                # 部分驱动（DirectSound 下的虚拟设备）在没有真实数据时不会阻塞，
+                # 而是立刻把上一次的缓冲区原样再返回一遍。逐字节相同的相邻数据块
+                # 说明没有新的采样——按静音处理，既让无信号时音量表能回落，也避免
+                # 把驱动复用的垃圾缓冲区当成信号。
+                fresh = data != last_data
+                last_data = data
+                if time.time() >= discard_until:
+                    level = self.meter_level(data) if fresh else 0.0
+                    self._update_input_volume(level)
+                # read 不阻塞时上面的循环会空转占满 CPU，按帧时长节流
+                elapsed = time.time() - started
+                if elapsed < chunk_seconds:
+                    time.sleep(chunk_seconds - elapsed)
+        finally:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    def stop_input_monitor(self):
+        """停止输入音量监听线程"""
+        # 先让旧线程失效（token 变化），再关闭它的流以解除阻塞中的 read
+        self._volume_monitor_token += 1
+        self._volume_monitor_running = False
+        stream = self._volume_monitor_stream
+        self._volume_monitor_stream = None
+        if stream is not None:
+            try:
+                stream.stop_stream()
+            except Exception:
+                pass
+        thread = self._volume_monitor_thread
+        if thread and thread.is_alive():
+            thread.join(timeout=1)
+        self._volume_monitor_thread = None
+        self._volume_monitor_index = None
+        # 归零并向界面报告"无信号"，避免切换设备后残留上一个设备的音量
+        self.input_volume = 0.0
+        self._input_volume_time = 0.0
 
     def add_translated_text(self, original_text, translated_text):
         """

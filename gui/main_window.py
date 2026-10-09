@@ -1,22 +1,29 @@
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                             QPushButton, QComboBox, QLabel, QSlider, QColorDialog,
-                            QGroupBox, QCheckBox, QSpinBox, QFileDialog, QMessageBox)
+                            QGroupBox, QCheckBox, QSpinBox, QFileDialog, QMessageBox,
+                            QSizePolicy)
 from PySide6.QtCore import Qt, QTimer, Slot
-from PySide6.QtGui import QFont, QColor
+from PySide6.QtGui import QFont, QColor, QFontMetrics
 import os
+import re
 import whisper
 import torch
 import threading
 import time
 from PySide6.QtWidgets import QApplication
 
-from audio.audio_manager import AudioManager
+from audio.audio_manager import AudioManager, clean_device_name, display_device_name
 from translation.subtitle_manager import SubtitleManager
+from translation.translation_worker import TranslationWorker
 from gui.subtitle_window import SubtitleWindow
+from gui.volume_meter import VolumeMeter
 from config import config
 
 # 调试开关，控制是否输出调试信息到控制台
 DEBUG_MODE = False
+
+# 按过"测试"之后，提示里显示"测试音送到了哪台设备"的时长（秒）
+TEST_HINT_SECONDS = 6.0
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -40,14 +47,22 @@ class MainWindow(QMainWindow):
         self.init_ui()
         
         # 启动定时器定期更新翻译结果
+        #
+        # 200ms 而不是原来的 500ms：翻译已经挪到后台线程，这个定时器现在只做
+        # "取值 + 刷标签"这种很轻的活，间隔小一点原文上屏才够快。
         self.timer = QTimer()
-        self.timer.setInterval(500)  # 增加到500ms，减少UI更新频率
+        self.timer.setInterval(200)
         self.timer.timeout.connect(self.update_subtitles)
-        
-        # 记录上次更新UI的时间，避免过于频繁的更新
-        self.last_update_time = 0
-        self.ui_update_interval = 500  # 500ms最小UI更新间隔，减少UI更新频率
-        
+
+        # 后台翻译线程：避免翻译（实测单句 2.1~2.7 秒）阻塞界面
+        self.translation_worker = TranslationWorker(self.subtitle_manager.translate)
+
+        # 音量表定时器（更快的刷新频率）
+        self.volume_timer = QTimer()
+        self.volume_timer.setInterval(80)
+        self.volume_timer.timeout.connect(self.update_volume_meter)
+        self.volume_timer.start()
+
         # 记录当前显示的文本，避免重复更新相同内容
         self.current_displayed_text = ""
         self.current_displayed_translation = ""
@@ -99,6 +114,40 @@ class MainWindow(QMainWindow):
         if DEBUG_MODE:
             print("设置检查与更新完成")
         
+    def _configure_device_combo(self, combo):
+        """设备下拉框的基础配置。
+
+        设备名很长（例如 "DELL S2721DGF (NVIDIA High Definition Audio) (Index: 19)"），
+        这里先给一个较小的宽度下限，等设备列表填充完毕后由 _sync_device_combo_widths()
+        统一设置成"刚好能完整显示最长设备名"的同一宽度：既不会截断名称，也不会把同一行
+        的音量控件挤出窗口。
+        """
+        combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(10)
+        combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        combo.setMinimumWidth(160)
+
+    def _sync_device_combo_widths(self):
+        """让输入/输出两个下拉框等宽，且宽度足够完整显示最长的设备名。
+
+        两个下拉框分处两行，若各自按自身内容取宽就会一长一短。这里取两份列表中最长的
+        设备名计算宽度，统一应用到两个下拉框（含展开后的下拉列表），保证等宽且都不截断。
+        """
+        combos = [self.input_device_combo, self.output_device_combo]
+        widest = 0
+        for combo in combos:
+            metrics = QFontMetrics(combo.font())
+            for i in range(combo.count()):
+                widest = max(widest, metrics.horizontalAdvance(combo.itemText(i)))
+        if widest <= 0:
+            return
+        # 预留下拉箭头、内边距与边框的宽度
+        width = widest + 56
+        for combo in combos:
+            combo.setMinimumWidth(width)
+            combo.view().setMinimumWidth(width)
+
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -112,17 +161,38 @@ class MainWindow(QMainWindow):
         input_layout = QHBoxLayout()
         input_label = QLabel("输入设备:")
         self.input_device_combo = QComboBox()
+        self._configure_device_combo(self.input_device_combo)
         input_layout.addWidget(input_label)
         input_layout.addWidget(self.input_device_combo)
-        
+        input_layout.addWidget(QLabel("音量:"))
+        self.input_volume_meter = VolumeMeter(tooltip="输入设备当前音量")
+        input_layout.addWidget(self.input_volume_meter)
+        input_layout.addStretch()
+
         output_layout = QHBoxLayout()
         output_label = QLabel("输出设备:")
         self.output_device_combo = QComboBox()
+        self._configure_device_combo(self.output_device_combo)
         output_layout.addWidget(output_label)
         output_layout.addWidget(self.output_device_combo)
-        
+        output_layout.addWidget(QLabel("音量:"))
+        self.output_volume_meter = VolumeMeter(tooltip="真正写进输出设备的音量（需勾选“监听系统声音”并开始翻译）")
+        output_layout.addWidget(self.output_volume_meter)
+        self.test_output_button = QPushButton("测试")
+        self.test_output_button.setToolTip("向当前选择的输出设备播放一段测试音，用来确认监听到底有没有出声")
+        self.test_output_button.clicked.connect(self.on_test_output)
+        output_layout.addWidget(self.test_output_button)
+        output_layout.addStretch()
+
         self.monitor_checkbox = QCheckBox("监听系统声音")
-        
+        self.monitor_checkbox.setToolTip("把采集到的声音原样送到上面选择的输出设备（勾选后立即生效，不必重新开始翻译）")
+
+        # 监听相关的提示：没选设备、选到虚拟声卡、播放失败都在这里说明
+        # 颜色由 update_monitor_hint 按"是否真有问题"切换：正常状态是灰字，出问题才变红
+        self.monitor_hint_label = QLabel("")
+        self.monitor_hint_label.setWordWrap(True)
+        self.monitor_hint_label.setStyleSheet("color: #555555;")
+
         # 添加延迟控制部分
         delay_layout = QHBoxLayout()
         self.audio_delay_checkbox = QCheckBox("添加音频延迟")
@@ -153,6 +223,7 @@ class MainWindow(QMainWindow):
         device_layout.addLayout(input_layout)
         device_layout.addLayout(output_layout)
         device_layout.addWidget(self.monitor_checkbox)
+        device_layout.addWidget(self.monitor_hint_label)
         device_layout.addLayout(delay_layout)
         device_layout.addWidget(self.show_audio_stats_checkbox)
         device_group.setLayout(device_layout)
@@ -439,7 +510,11 @@ class MainWindow(QMainWindow):
             # 停止定时器
             if hasattr(self, 'timer') and self.timer:
                 self.timer.stop()
-            
+
+            # 停止后台翻译线程
+            if hasattr(self, 'translation_worker') and self.translation_worker:
+                self.translation_worker.stop()
+
             # 确保录音停止
             if hasattr(self, 'audio_manager') and self.audio_manager:
                 if hasattr(self.audio_manager, 'is_running') and self.audio_manager.is_running:
@@ -447,7 +522,11 @@ class MainWindow(QMainWindow):
                     self.audio_manager.stop_recording()
                     # 等待音频管理器所有线程结束
                     time.sleep(0.5)
-                
+
+                # 停止输入音量监听
+                if hasattr(self.audio_manager, 'stop_input_monitor'):
+                    self.audio_manager.stop_input_monitor()
+
                 # 清理音频处理器资源
                 if hasattr(self.audio_manager, 'audio_processor'):
                     if hasattr(self.audio_manager.audio_processor, 'cleanup'):
@@ -532,14 +611,23 @@ class MainWindow(QMainWindow):
         self.output_device_combo.clear()
         self.output_device_combo.addItems(output_devices)
         
-        # 加载上次使用的设备设置
+        # 加载上次使用的设备设置（按友好名称匹配，兼容旧版本被截断的设备名）
         saved_input = config.get("input_device", "")
-        if saved_input and saved_input in input_devices:
-            self.input_device_combo.setCurrentText(saved_input)
-        
+        matched_input = self._find_device_match(saved_input, input_devices)
+        if matched_input:
+            self.input_device_combo.setCurrentText(matched_input)
+
         saved_output = config.get("output_device", "")
-        if saved_output and saved_output in output_devices:
-            self.output_device_combo.setCurrentText(saved_output)
+        matched_output = self._find_device_match(saved_output, output_devices)
+        if matched_output:
+            self.output_device_combo.setCurrentText(matched_output)
+        elif saved_output:
+            # 记不到上次那台设备（拔掉了/改名了）：别悄悄用第一台，明确提示
+            print(f"警告: 找不到上次使用的输出设备 '{saved_output}'，"
+                  f"已回退到 '{self.output_device_combo.currentText()}'")
+
+        # 两个下拉框取同一宽度，完整显示最长的设备名
+        self._sync_device_combo_widths()
         
         # 设置监听选项
         self.monitor_checkbox.setChecked(config.get("monitor_enabled", False))
@@ -561,7 +649,75 @@ class MainWindow(QMainWindow):
         self.monitor_checkbox.stateChanged.connect(self.on_monitor_changed)
         self.audio_delay_checkbox.stateChanged.connect(self.on_audio_delay_checked)
         self.audio_delay_slider.valueChanged.connect(self.on_audio_delay_changed)
-    
+
+        # 开启输入音量监听（供音量表显示，未录音时也能看到输入是否有信号）
+        self._refresh_input_monitor()
+
+    def _find_device_match(self, saved, devices):
+        """在设备列表中查找与已保存设置匹配的条目，兼容旧版本被截断/乱码的设备名"""
+        if not saved:
+            return None
+
+        # 完全一致匹配（含索引），用于区分同名设备（如两个相同的显示器）
+        for device in devices:
+            if device == saved:
+                return device
+
+        def friendly_name(text):
+            idx = text.find(' (Index:')
+            name = text[:idx] if idx != -1 else text
+            # 按修复乱码后的名字比较：以前存下的 "鑰虫満 (AirPods Pro)" 现在
+            # 列表里是 "耳机 (AirPods Pro)"，不修就匹配不上，会悄悄退回第一个设备
+            return clean_device_name(name).strip().lower()
+
+        saved_name = friendly_name(saved)
+        if not saved_name:
+            return None
+
+        # 精确匹配（按名称）优先，其次前缀匹配（旧版 MME 名字被截断，
+        # 如存的是 "CABLE Output (VB-Audio Virtual "）
+        exact = [d for d in devices if friendly_name(d) == saved_name]
+        fuzzy = [d for d in devices
+                 if friendly_name(d).startswith(saved_name) or saved_name.startswith(friendly_name(d))]
+
+        for candidates in (exact, fuzzy):
+            if not candidates:
+                continue
+            # 名字相同的设备（两台同型号显示器）只能靠存下来的索引区分：
+            # 索引还落在这批同名条目里，就说明它没指错，用它
+            saved_index = self._label_index(saved)
+            if saved_index is not None:
+                for device in candidates:
+                    if self._label_index(device) == saved_index:
+                        return device
+            return candidates[0]
+        return None
+
+    @staticmethod
+    def _label_index(text):
+        """从 "名称 (Index: N)" 里取出索引；取不到返回 None"""
+        match = re.search(r'Index: (\d+)', text or '')
+        return int(match.group(1)) if match else None
+
+    def update_volume_meter(self):
+        """更新输入/输出音量表"""
+        if hasattr(self, 'input_volume_meter'):
+            self.input_volume_meter.set_level(self.audio_manager.get_input_volume())
+        if hasattr(self, 'output_volume_meter'):
+            self.output_volume_meter.set_level(self.audio_manager.get_output_volume())
+        # 播放失败要马上在界面上显示原因，而不是只在控制台打日志
+        self.update_monitor_hint()
+
+    def _refresh_input_monitor(self):
+        """根据当前选择的输入设备与运行状态，开启/停止音量监听"""
+        if self.audio_manager.is_running:
+            return
+        device = self.input_device_combo.currentText() if hasattr(self, 'input_device_combo') else ''
+        if device:
+            self.audio_manager.start_input_monitor(device)
+        else:
+            self.audio_manager.stop_input_monitor()
+
     def update_delay_controls_state(self):
         """根据监听选项的状态更新延迟控件的启用状态"""
         is_monitor_enabled = self.monitor_checkbox.isChecked()
@@ -619,10 +775,172 @@ class MainWindow(QMainWindow):
         """监听选项变更时的处理"""
         enabled = state == Qt.CheckState.Checked.value
         config.set("monitor_enabled", enabled)
-        
+
+        # 立即生效：正在翻译时勾选马上开始播放，取消马上停止（否则要停机再开始才生效）
+        if self.audio_manager.is_running:
+            started = self.audio_manager.set_monitor_enabled(enabled)
+            if enabled and not started:
+                QMessageBox.warning(self, "无法监听",
+                                    "监听已开启，但没有可用的输出设备。\n"
+                                    "请在“输出设备”里选择一个真实的耳机或扬声器。")
+        else:
+            # 未开始时只记录配置，真正的启动交给“开始翻译”
+            if enabled and not self.output_device_combo.currentText():
+                QMessageBox.warning(self, "无法监听", "请先在“输出设备”里选择要播放到的设备。")
+
         # 更新延迟控件的启用状态
         self.update_delay_controls_state()
-    
+        self.update_monitor_hint()
+
+    def on_test_output(self):
+        """把测试音播放到当前选择的输出设备"""
+        device = self.output_device_combo.currentText()
+        if not device:
+            QMessageBox.warning(self, "无法测试", "请先选择输出设备")
+            return
+
+        monitoring = self.audio_manager.is_running and self.monitor_checkbox.isChecked()
+        if monitoring:
+            # 测试音和监听共用输出设备，先让出设备避免争用
+            self.audio_manager.set_monitor_enabled(False)
+
+        ok, error = self.audio_manager.play_test_tone(device)
+
+        if monitoring:
+            # 测试音播完再恢复监听（给测试音留出播放时间）
+            QTimer.singleShot(1600, lambda: self.audio_manager.set_monitor_enabled(True))
+
+        if not ok:
+            QMessageBox.warning(self, "播放测试音失败", error)
+            return
+
+        # 告诉用户声音实际送去了哪个设备——界面标签里的索引可能是旧快照，
+        # 直接按标签判断"我放的是耳机"会得出错误结论。这条提示只显示几秒
+        actual = getattr(self.audio_manager, 'test_tone_device', None)
+        if actual:
+            self._last_test_tone_device = actual
+            self._last_test_tone_time = time.time()
+            self.update_monitor_hint()
+
+    def update_monitor_hint(self):
+        """提示监听状态与问题：没选设备 / 选到虚拟声卡 / 显示器音频 / 播放失败
+
+        平时只留一行状态，不堆信息；只有真出问题才变红字并给出建议。播放帧数只在
+        "一直是 0"（数据根本没送进设备）时才提——正常监听时报帧数只是噪音。
+        """
+        if not hasattr(self, 'monitor_hint_label'):
+            return
+
+        messages = []
+        problem = False
+        now = time.time()
+
+        # 刚按过"测试"：几秒内显示测试音进了哪台设备。带上索引是因为两台同型号显示器
+        # 在列表里同名（"DELL S2721DGF"），只有索引能说明刚测的是哪一台
+        if now - getattr(self, '_last_test_tone_time', 0.0) < TEST_HINT_SECONDS:
+            tested = getattr(self, '_last_test_tone_device', None)
+            if tested:
+                index = self.audio_manager.test_tone_index
+                where = f"「{display_device_name(tested)}」"
+                if index is not None:
+                    where += f"（索引 {index}）"
+                messages.append(f"测试音已送到{where}；没听到就说明这台不出声。")
+
+        if self.monitor_checkbox.isChecked():
+            device = self.output_device_combo.currentText()
+            # 去掉 "(Index: N)" 尾巴，但保留 "(ToDesk Virtual Audio)" 这类说明
+            short = device.rsplit(" (Index:", 1)[0] if device else device
+            # 判断"是不是虚拟声卡/显示器接口"要看设备的原始全名：下拉框里的名字为了好看
+            # 已经把驱动样板名去掉了（"DELL S2721DGF (NVIDIA High Defi" -> "DELL S2721DGF"），
+            # 光看标签认不出显示器接口。原始名只在设备变了之后查一次，不随定时器反复查
+            raw_name = self._raw_device_name(device)
+            if not device:
+                messages.append("没有选择输出设备，监听不会出声。")
+                problem = True
+            elif self._is_virtual_output(raw_name):
+                messages.append(f"「{short}」是虚拟声卡：声音会进虚拟声卡，不会进耳机/扬声器。")
+                problem = True
+            elif self._is_display_output(raw_name):
+                # 接了音箱的显示器是能出声的，别一口咬定不行——让它以"测试"为准
+                messages.append(f"「{short}」是显示器的音频接口：显示器没接音箱就不会出声，"
+                                "按“测试”能听到声音就说明这台可以。")
+                problem = True
+
+            if problem:
+                messages.append("蓝牙耳机要出现在上面，需在系统“声音设置”里把它从"
+                                "“免手操作”切回“立体声”。")
+
+            if self.audio_manager.is_running and device:
+                error = self.audio_manager.get_output_error()
+                written = self.audio_manager.get_playback_frames_written()
+                if error:
+                    messages.append(error)
+                    problem = True
+                    self._monitor_zero_since = None
+                elif written == 0:
+                    # 帧数一直是 0 说明数据根本没送进设备。刚启动时本来就没数据，
+                    # 所以给它 2 秒宽限，避免一开监听就闪一下报错
+                    if getattr(self, '_monitor_zero_since', None) is None:
+                        self._monitor_zero_since = now
+                    elif now - self._monitor_zero_since > 2.0:
+                        messages.append("监听中，但还没有数据写进输出设备。")
+                        problem = True
+                else:
+                    self._monitor_zero_since = None
+                    actual = self.audio_manager.get_monitor_device_name()
+                    target = display_device_name(actual) if actual else short
+                    index = self.audio_manager.get_monitor_device_index()
+                    where = f"{target}（索引 {index}）" if index is not None else target
+                    messages.append(f"正在监听：声音输出到「{where}」。")
+        else:
+            self._monitor_zero_since = None
+
+        hint = "\n".join(messages)
+        color = "#c0392b" if problem else "#555555"
+        # 这个方法被音量定时器每 80ms 调一次，内容没变就别动控件
+        if (hint, color) != getattr(self, '_hint_cache', None):
+            self._hint_cache = (hint, color)
+            self.monitor_hint_label.setStyleSheet(f"color: {color};")
+            self.monitor_hint_label.setText(hint)
+
+    def _raw_device_name(self, device):
+        """按标签取设备的原始全名（含驱动描述），用于判断设备类型
+
+        下拉框里显示的是整理过的名字，判断"虚拟声卡/显示器接口"需要那些被去掉的关键词
+        （"NVIDIA High Definition Audio"）。同一个设备的标签不变就不重复查——这个方法
+        被音量定时器每 80ms 调一次。
+        """
+        cached = getattr(self, '_raw_device_cache', None)
+        if cached is not None and cached[0] == device:
+            return cached[1]
+        raw = device or ""
+        try:
+            raw = self.audio_manager.describe_output_device(self._label_index(device)) or raw
+        except Exception:
+            pass
+        self._raw_device_cache = (device, raw)
+        return raw
+
+    @staticmethod
+    def _is_virtual_output(device):
+        """判断输出设备是否是虚拟声卡（选它当监听目标就等于没声音）"""
+        lower = device.lower()
+        markers = ('cable input', 'vb-audio', 'todesk virtual', '网易虚拟', 'virtual audio',
+                   'virtual cable')
+        return any(marker in lower for marker in markers)
+
+    @staticmethod
+    def _is_display_output(device):
+        """判断输出是否是显示器/显卡的 HDMI/DP 音频接口（多半没有扬声器）
+
+        标记词都取前 16 个字符以内：设备列表走 MME，名字被截断到 31 字符，
+        "NVIDIA High Definition Audio" 到列表里只剩 "NVIDIA High Defi"，
+        写全称会匹配不上，提示就再也不显示了。
+        """
+        lower = device.lower()
+        markers = ('nvidia high defi', 'amd high defi', 'display audio', 'hdmi')
+        return any(marker in lower for marker in markers)
+
     def select_original_color(self):
         """打开原文颜色选择对话框"""
         color = QColorDialog.getColor()
@@ -730,7 +1048,14 @@ class MainWindow(QMainWindow):
             self.timer.stop()
             self.start_button.setText("开始翻译")
             self.subtitle_window.hide()
-            
+
+            # 下次开始时按新文本重新刷新，避免沿用上一轮的"当前文本"判断
+            self.current_displayed_text = ""
+            self.current_displayed_translation = ""
+
+            # 恢复输入音量监听
+            self._refresh_input_monitor()
+
             # 保存字幕文件
             if self.audio_manager.is_subtitle_recording():
                 QMessageBox.information(self, "字幕保存", "字幕已保存到 Subtitles 目录")
@@ -792,119 +1117,97 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(5000, self.subtitle_window.hide)
     
     def update_subtitles(self):
-        """更新字幕内容"""
-        # 检查距离上次更新UI的时间间隔
-        current_time = time.time() * 1000  # 转换为毫秒
-        if current_time - self.last_update_time < self.ui_update_interval:
-            # 如果更新太频繁，跳过此次更新
-            return
-        
-        # 获取最新识别的文本
+        """更新字幕内容
+
+        识别出原文后**立刻**把原文刷到字幕窗口，翻译交给后台线程，译文算好了再
+        补上。原来这两步是在同一次刷新里同步做的，而翻译要 2 秒多，所以原文也
+        跟着一起等——这就是"原文不实时"的原因。
+        """
+        # 1) 有新识别结果：原文立即上屏，并把翻译丢给后台线程
         text = self.audio_manager.get_latest_text()
-        
-        # 调试: 打印从音频管理器获取的文本
-        print(f"从AudioManager获取的最新文本: {text}")
-        
-        # 如果没有文本，不进行更新
-        if not text:
-            print("没有获取到文本，跳过更新")
-            return
-            
-        # 检查文本是否与当前显示的相同，避免重复更新
-        if text == self.current_displayed_text:
-            # 只更新延迟信息，不进行完整UI更新
-            print(f"文本未变化，跳过更新: '{text[:30]}...'")
-            self.update_delay_info()
-            return
-            
-        # 更新最后一次UI更新时间戳
-        self.last_update_time = current_time
-        # 保存当前显示的文本
-        self.current_displayed_text = text
-        
-        print(f"准备更新UI，新文本: '{text[:30]}...'")
-            
-        # 更新原文预览，只有当确实需要显示时才更新
+
+        if text and text != self.current_displayed_text:
+            self.current_displayed_text = text
+            self.current_displayed_translation = ""
+
+            print(f"新识别文本，立即显示原文: '{text[:30]}...'")
+            self._show_original_text(text)
+
+            target_language = self.target_language_combo.currentText()
+            if target_language == "不翻译":
+                print("不翻译模式，不提交翻译")
+                if self.subtitle_preview.isVisible():
+                    self.subtitle_preview.setText("")
+            elif self._is_same_language(text):
+                # 源语言就是目标语言，没必要求助 Google（要花 2 秒，还可能把
+                # 中文又"翻译"一遍），直接拿原文当译文
+                print("识别语种与目标语言相同，跳过翻译")
+                self.audio_manager.add_translated_text(text, text)
+                self._apply_translation(text, text)
+            else:
+                print(f"提交后台翻译，目标语言: {target_language}")
+                self.translation_worker.request(text, target_language)
+
+        # 2) 收取后台翻译结果（可能一次收到多条，这里都会处理）
+        for _seq, src_text, translation in self.translation_worker.poll():
+            if not translation:
+                continue
+            # 不管是不是当前显示的那条，都记进字幕管理器（SRT 落盘用）
+            self.audio_manager.add_translated_text(src_text, translation)
+            if src_text == self.current_displayed_text:
+                self._apply_translation(src_text, translation)
+            else:
+                print(f"翻译结果已过期，不显示: '{src_text[:20]}...'")
+
+        # 3) 更新语言识别标签和延迟信息
+        self.update_detected_language_label()
+        self.update_delay_info()
+
+    def _show_original_text(self, text):
+        """把原文立刻显示到预览区和字幕窗口（不等翻译）"""
         if self.original_preview.isVisible():
             self.original_preview.setText(text)
-            print("已更新原文预览")
-        
-        # 获取当前字幕模式
+
+        if not self.subtitle_window.isVisible():
+            print("字幕窗口不可见，跳过原文显示")
+            return
+
         subtitle_mode = config.get("subtitle_mode", "translated")
-        
-        # 检查是否选择了"不翻译"
-        target_language = self.target_language_combo.currentText()
-        is_translation_disabled = target_language == "不翻译"
-        
-        # 优化：创建一个本地变量存储字幕文本，避免多次更新窗口
-        original_text_for_subtitle = ""
-        translation_text_for_subtitle = ""
-        
-        if is_translation_disabled:
-            # 不翻译模式：直接使用原文，清空译文
-            print("不翻译模式，直接使用原文")
-            if self.subtitle_preview.isVisible():
-                self.subtitle_preview.setText("")
-            original_text_for_subtitle = text
+        if subtitle_mode == "translated":
+            # 仅显示译文模式下，原文标签是隐藏的，先把原文填到译文行上，
+            # 这样用户马上就能看到内容，等译文回来再替换
+            self.subtitle_window.update_text(original_text=text)
         else:
-            try:
-                # 翻译文本
-                print(f"开始翻译文本到 {target_language}")
-                translation = self.subtitle_manager.translate(text, target_language)
-                print(f"翻译结果: '{translation[:30]}...'")
-                
-                # 检查翻译是否与当前显示的相同
-                if translation == self.current_displayed_translation:
-                    # 翻译没有变化，只更新原文和延迟信息
-                    print("翻译结果未变化，只更新原文")
-                    if subtitle_mode == "both" and self.original_preview.isVisible():
-                        self.original_preview.setText(text)
-                    self.update_delay_info()
-                    return
-                    
-                # 保存当前显示的翻译
-                self.current_displayed_translation = translation
-                
-                # 将译文保存到音频管理器的字幕管理器中
-                self.audio_manager.add_translated_text(text, translation)
-                
-                # 更新译文预览，只有当需要显示时才更新
-                if self.subtitle_preview.isVisible():
-                    self.subtitle_preview.setText(translation)
-                    print("已更新译文预览")
-                
-                # 根据当前字幕模式准备字幕文本
-                if subtitle_mode == "translated":
-                    translation_text_for_subtitle = translation
-                elif subtitle_mode == "original":
-                    original_text_for_subtitle = text
-                else:  # both
-                    original_text_for_subtitle = text
-                    translation_text_for_subtitle = translation
-                
-                print(f"字幕模式: {subtitle_mode}, 原文: '{original_text_for_subtitle[:20]}...', 译文: '{translation_text_for_subtitle[:20]}...'")
-                
-            except Exception as e:
-                print(f"翻译错误: {e}")
-                # 翻译出错时使用原文
-                original_text_for_subtitle = text
-        
-        # 只在需要时更新字幕窗口，并且只更新一次
+            self.subtitle_window.update_text(original_text=text, translation_text="")
+
+    def _apply_translation(self, text, translation):
+        """译文就绪：更新预览区和字幕窗口"""
+        self.current_displayed_translation = translation
+
+        if self.subtitle_preview.isVisible():
+            self.subtitle_preview.setText(translation)
+
+        subtitle_mode = config.get("subtitle_mode", "translated")
+        print(f"应用译文（模式={subtitle_mode}）: '{translation[:30]}...'")
+
         if self.subtitle_window.isVisible():
-            print("更新字幕窗口内容")
-            self.subtitle_window.update_text(
-                original_text=original_text_for_subtitle,
-                translation_text=translation_text_for_subtitle
-            )
-        else:
-            print("字幕窗口不可见，跳过更新")
-        
-        # 更新语言识别标签
-        self.update_detected_language_label()
-        
-        # 更新延迟信息
-        self.update_delay_info()
-    
+            self.subtitle_window.update_text(original_text=text,
+                                            translation_text=translation)
+
+    def _is_same_language(self, text):
+        """判断识别出的源语言是否就是目标语言"""
+        detected = self.audio_manager.get_detected_language()
+        if not detected:
+            return False
+        target_name = self.target_language_combo.currentText()
+        target_code = self.subtitle_manager.get_language_code(target_name)
+        if not target_code:
+            return False
+        # whisper 给的是 "zh"，googletrans 用的是 "zh-cn"
+        detected_norm = detected.lower().replace("_", "-").split("-")[0]
+        target_norm = target_code.lower().replace("_", "-").split("-")[0]
+        return detected_norm == target_norm
+
     def update_detected_language_label(self):
         """更新检测到的语言标签"""
         language_code = self.audio_manager.get_detected_language()
@@ -1424,10 +1727,22 @@ class MainWindow(QMainWindow):
     def on_input_device_changed(self, device):
         """输入设备变更时的处理"""
         config.set("input_device", device)
-        
+        self._refresh_input_monitor()
+
     def on_output_device_changed(self, device):
         """输出设备变更时的处理"""
         config.set("output_device", device)
+        # 换设备后上一次的测试结论就不适用了
+        self._last_test_tone_device = None
+        self._last_test_tone_time = 0.0
+        # 换了设备，帧数为 0 的计时重新开始
+        self._monitor_zero_since = None
+
+        # 正在监听时换设备：立刻按新设备重开输出流，否则还在往旧设备放声音
+        if self.audio_manager.is_running:
+            self.audio_manager.set_output_device(device)
+
+        self.update_monitor_hint()
 
     def _load_initial_model(self, model_name):
         """加载初始模型"""
