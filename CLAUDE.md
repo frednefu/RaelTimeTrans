@@ -30,13 +30,14 @@ python test_word_reveal.py      # 逐词字幕的显示调度（无音频/Whispe
 
 - 检查逐词时间轴：`python check_word_timestamps.py <wav> [模型] [设备]`
 - 量同步误差是谁的锅：`python check_word_alignment.py [模型] [间隔秒 ...]`。用 Windows 自带语音合成把词按固定间隔摆好（真实起点已知），再跑一遍识别，打印"Whisper 给的词起点 vs 真值"的误差——用来分清"字幕对不上声音"是识别的时间轴不准，还是我们自己的播放进度算错了。
+- 检查原文两行 / 换句滚动：`python check_reveal_scroll.py`。离屏（`QT_QPA_PLATFORM=offscreen`）喂一串脚本化的句子，每隔 20ms `grab()` 一次扫像素，用文字行的位置验几何：行距 = `lineSpacing()`、第一行贴框顶、逐词增长时位置不动、滚动全程不超两行且滚完停在原位、不翻译模式也两行、整句通路不被裁剪，以及上/中/下三处间隙相等、窗口高度正好贴内容、间隙随字号变（`--live` 用 settings.json 里那套）。不带音频/Whisper。
 
 ## Architecture
 
 顶层是 `main.py` → `QApplication` + `gui/main_window.py` 的 `MainWindow`。各包职责：
 
 - `gui/main_window.py` — 主窗口，承载所有设置项与"开始/停止翻译"按钮。通过 `QTimer`（200ms）轮询 `AudioManager`：先按播放进度推进逐词原文，再取最新整句识别文本交给后台翻译线程 `translation/translation_worker.py`，译文回来再补上（翻译不在 GUI 线程里做）。
-- `gui/subtitle_window.py` — 无边框、置顶、半透明的悬浮字幕窗 `SubtitleWindow`，独立于主窗口，显示原文/译文。`set_original_words` 专门给逐词通路用（含逐词行的左对齐排版）。
+- `gui/subtitle_window.py` — 无边框、置顶、半透明的悬浮字幕窗 `SubtitleWindow`，独立于主窗口，显示原文/译文。两个标签各装在一个定高裁剪框 `RevealViewport` 里（换句时靠它整块上滚一行）；`set_original_words` 专门给逐词通路用（含逐词行的左对齐排版与两行上下文）。
 - `gui/word_reveal.py` — `WordReveal`：拿带块号的词表 + 当前播放位置，算出"这一刻该显示到哪个词"（连同上那句的全文，给界面摆两行用），返回 None 表示不用重绘。纯逻辑（无 Qt/音频依赖）。单测见 `test_word_reveal.py`。
 - `audio/audio_timeline.py` — 逐词字幕的时间轴数据结构（`TimedWord`/`WordSegment`/`AudioSegmentTask`），刻意做成不引入 whisper/torch 的叶子模块，供界面和单测导入。
 - `audio/audio_manager.py` — `AudioManager`，音频管线编排中心。三条线程：录音（`_record_audio`，做音量 VAD 分段）→ 识别（`_recognize_audio`）→ 播放（`_playback_audio`，仅监听系统声音时）。用 `queue.Queue` 在线程间传 NumPy 音频数据。
@@ -62,11 +63,16 @@ python test_word_reveal.py      # 逐词字幕的显示调度（无音频/Whispe
 - **播放位置**：`get_play_position_chunks()` = 采集块号 − 播放队列积压（`playback_queue.qsize() + _OUTPUT_BUFFER_CHUNKS`，上限 `_MAX_LAG_CHUNKS`）。监听关闭或播放线程已死时按实时采集算。**这就是"变动的延迟"的正解**：不用手动填滑块，数一数还有多少块没播出去就知道了。（`audio_delay_enabled/audio_delay_ms` 那套手动延迟已删除。）
 - **预览识别**（`kind="partial"`）：说话过程中每 `partial_interval_ms`（默认 1000ms）用当前缓冲区快照跑一次识别，只喂逐词显示。它**绝不排队**（线程池忙就跳过这一帧，`process_audio_async` 返回 None）、**绝不进 `text_queue`/SRT/翻译**——半截句子的错识别只能在屏幕上闪一下，最终结果一到就整句替换。
 - **显示**：`WordReveal.tick_line(play_chunk)` 选"起点不晚于播放位置的最近一段"，把起点已过的词拼成一行，另外给出**上一句的全文**（`previous_text`）。识别慢了会一次补齐（不卡住、不倒着走），一句话说完而下一句未开始则继续显示上一句；当前行文本、上一句文本、句号三者都没变就返回 None，界面不会无端重排。（`tick()` 是只返回文本的旧接口，单测在用。）
-- **排版**（`SubtitleWindow.set_original_words`）：逐词行固定**左对齐**（`_apply_reveal_layout` 设 `AlignLeft|AlignVCenter`），新词在右边接着长，左边的字一动不动——居中会每多一个字就把整行重排一次，看着一直在抖。不挪标签本身（标签仍占满整行、超长照旧换行），只用样式表给文字留出固定的左边留白：`_label_stylesheet` 写的是 `padding: Npx; padding-left: (N+REVEAL_LEFT_MARGIN)px;`（长写覆盖简写），所有标签样式都从这一个出口走，免得别处设颜色时把这个留白抹掉。整句通路（原文整句/译文，走 `_set_sentence_text`）写进来的文本一律恢复居中排版——"仅显示译文"模式下逐词原文刚占着译文行。
-- **原文两行**（上一句 + 当前句）：`_compose_reveal_text` 把上一句按 `_reveal_avail_width`（标签宽 − 左右内边距 − 左边留白）用 `QFontMetrics.elidedText` 截断，再和当前句用 `\n` 拼成两行——上一句在上、当前句在下，便于顺着上下文听（像 YouTube）。宽度必须按左边留白一起扣，宽一点点上一句就会折成两行、把当前句挤出可见范围。只有原文行这么做（`_reveal_two_lines()`：逐词开着、没选"不翻译"、且不是"仅显示译文"模式）。
-- **窗口高度**：两行原文 + 译文比用户设的 `window_height`（settings.json 现为 80）高，所以原文标签的最小高度按两行算（`adjustLabelHeights`），窗口在 `show()`/`showEvent`/`set_subtitle_mode` 里按 `max(window_height, _required_height())` 撑高（`_fit_window_height`），否则第二行会被切掉。逐词开关关掉时 `reset_reveal_layout` 把两行恢复居中并把高度退回用户设置。
+- **排版**（`SubtitleWindow.set_original_words`）：逐词行固定**左对齐**（`_apply_reveal_layout` 设 `AlignLeft|` 垂直方向见下条），新词在右边接着长，左边的字一动不动——居中会每多一个字就把整行重排一次，看着一直在抖。不挪标签本身（标签仍占满整行、超长照旧换行），只用样式表给文字留出固定的左边留白：`_label_stylesheet` 写的是 `padding: 上下 Npx; padding-left: (N+REVEAL_LEFT_MARGIN)px;`（长写覆盖简写，`REVEAL_LEFT_MARGIN = 32`），所有标签样式都从这一个出口走，免得别处设颜色时把这个留白抹掉。**标签还必须 `setIndent(0)`**：`QLabel.indent` 默认 −1，左对齐时它按字体再垫半个 `"x"` 宽（本机离屏字体 9px、真 Arial 3px，逐词行实测就是这样多出 9px），左边留白就成了"跟着字体环境浮动"的数，`_reveal_avail_width` 也会算宽一点（截断的上一句可能因此折成两行）；居中排版不受 `indent` 影响，所以整句通路行为不变。整句通路（原文整句/译文，走 `_set_sentence_text`）写进来的文本一律恢复居中排版——"仅显示译文"模式下逐词原文刚占着译文行。
+- **裁剪框**（`RevealViewport`）：每个标签都装在一个定高的裁剪框里，框里**不用布局**，标签的位置由 `_place_child` 给（`set_content_height(h)` 定内容高度、`set_scroll_offset(o)` 把内容整体上移 o）。裁剪是白送的：Qt 里子部件天然被父部件矩形裁掉。整句通路的内容高度是 0（标签填满裁剪框、偏移恒 0），所以这层对它完全透明。**窗口高度链路看的是裁剪框**（`adjustLabelHeights` → `_set_label_rows` 设裁剪框的 `minimumHeight`，`_required_height` 求和）——别去设标签自己的 `minimumHeight`，那是 `_place_child` 给的高度下限，设大了标签就压不下去、裁剪失效。
+- **原文两行**（上一句 + 当前句）：`_compose_reveal_text` 把上一句按 `_reveal_avail_width`（标签宽 − 左右内边距 − 左边留白）用 `QFontMetrics.elidedText` 截断，再和当前句用 `\n` 拼成两行——上一句在上、当前句在下，便于顺着上下文听（像 YouTube）。宽度必须按左边留白一起扣，宽一点点上一句就会折成两行、把当前句挤出可见范围。只有原文行这么做（`_reveal_two_lines()`：逐词开着、且不是"仅显示译文"模式；**"不翻译"模式下也算**——那时屏幕上只有原文，上一句更是唯一的上下文）。
+- **两行模式下必须顶对齐 + 上下内边距 0**（`_reveal_alignment` / `_label_vpadding`）：内容高度 = **2 × 行距**（多出来的第三行露不出来），文字第一行贴住框顶边，于是滚一个行距正好把上一行整行送出框外、当前句落到提交后它自己的位置上。行距要用 `QFontMetrics.lineSpacing()`（Arial 14 是 **22**），**不是 `height()`**（19，差 3px，滚动距离一差接缝就跳）。也别想着用负 `contentsMargins` 上移：Qt 会把上边距夹成 0，实测只表现为"高度缩了再居中"的 10px 位移。两行模式（`_reveal_two_lines()`）下**译文行的上下内边距也是 0**：文字上下的空白全交给布局的三处间隙，标签自己再垫一层，原文和译文各自的上下就不一样宽了。
+- **上/中/下三处间隙一样宽、按字号算**（`_apply_row_gaps` / `_row_gap`）：上 = 窗口顶边到原文框、中 = 原文框到译文框、下 = 译文框到窗口底边，三处都取 `max(MIN_ROW_GAP, round(较小行距 × ROW_GAP_RATIO))`（字号一改一起变，不用手填），分别落在布局的 `contentsMargins` 上边距、`spacing`、下边距上。窗口比内容高时多出来的部分**三处平分**（`(窗口高 − 行高之和) // 3`），不是全堆在原文和译文中间——那正是"中间空了好几行"的由来。间隙必须加在裁剪框**外面**：做成标签的上内边距（框内加白），上一行滚完还剩一截字形挂在框顶，一直挂到提交新文本那一帧才消失（看着就是闪一下）。
+- **行盒高度按行距算，不按字号盒子**（`_label_line_height`）：逐词行正好一个行距（上下内边距 0），整句通路（居中）才是 `行距 + 上下内边距`——标签盒比"文字 + 内边距"矮，字就会被裁掉半截。全句通路按实际折行数给高度（`_label_text_lines` 用 `QFontMetrics.boundingRect` 量），译文折成两行时窗口跟着变高。
+- **换句向上滚一行**（`set_original_words` + `_start_reveal_scroll`）：触发信号是 `utterance_id` 变化（`RevealLine` 早就带着它，界面以前没用），且要 `previous_text` 非空、两行模式、**当前框里已经有 `\n`（两行）**——这一轮的第一句不滚：它本来就占着第一行，滚了只会把唯一那行送出框外空一下。动画是 `QVariantAnimation`（OutCubic，`REVEAL_SCROLL_MS = 200`），距离 = 一个行距。**动画期间不动文本**，新文本只存进 `_reveal_pending`，`finished` 时偏移归零再一起贴上（滚动中途改文本画面会跳）——延迟 ≤200ms 而新句第一个词本来就要 1s 上下才识别出来，肉眼无感。切模式（`set_subtitle_mode`）、重开一轮（`reset_reveal_layout`）、窗口藏起来（`hideEvent`）都要 `_stop_reveal_scroll()`，免得动画停在半路。`hideEvent` 那里要 `apply_pending=False`：`_set_reveal_text` 见窗口不可见会 `show()`，等于关不掉。
+- **窗口高度默认贴着内容走**（`window_height_auto` / `_fit_window_height`）：`_required_height()` = 三处间隙 + 各可见裁剪框的最小高度，高度就是它——字号/行数/译文折行一变，窗口跟着收放，不会在原文和译文之间挂一片空白。`window_height_auto = False` 表示"高度是用户定的"：设置里改过高度（`on_window_height_changed` → `_lock_window_height`）或**按住鼠标**拖右下角（`resizeEvent` 里查 `QApplication.mouseButtons()`）之后就是这种状态，之后一律按他定的高度来（多出来的空间三处平分）。为什么要看鼠标键：Qt 自己在显示/隐藏过程中发的 resize 不该被当成"用户拖的"，否则高度一次就锁死、再也不跟着内容走。另外 Qt 的 `setFixedSize` 走的是 C++ 的 `resize`（`QWidget.resize` 不是虚函数），绕不过我们的重写，所以 `showEvent` 里那次精确尺寸要用 `_auto_set_fixed_size` 包一下（`_auto_resize_depth` 计数），不然同样会被当成用户拖的。
 - **不翻译**（目标语言选"不翻译"→ `target_language = "none"`）：只走原文通路，不提交翻译请求，字幕窗只留原文行（`SubtitleWindow.translation_disabled` 会强制隐藏译文行）。
-- 排查工具：`python check_word_timestamps.py <wav> [模型] [设备]` 打印每词时间轴，用来区分"逐词不生效"是模型问题还是设置问题。开关 `word_by_word_enabled=False` 可完全退回整句行为。
+- 排查工具：`python check_word_timestamps.py <wav> [模型] [设备]` 打印每词时间轴，用来区分"逐词不生效"是模型问题还是设置问题；`python check_reveal_scroll.py`（`--live` 用 settings.json 里那套字号/窗口）离屏喂一串脚本化的句子、扫像素验"两行 + 换句滚一行"的几何（行距、贴顶、滚完不跳、不翻译模式也两行、整句通路不被裁剪、译文折行不被裁），并逐个量：上/中/下三处间隙必须相等、等于 `_row_gap()` 那个按字号算的基准、窗口高度正好是 `_required_height()`，字号改大时间隙跟着变大，把窗口拉高 90px 后三处各分到 30px。开关 `word_by_word_enabled=False` 可完全退回整句行为。
 
 ## 需要注意的约定与陷阱
 

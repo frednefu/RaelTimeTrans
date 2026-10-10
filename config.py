@@ -27,6 +27,10 @@ class Config:
             "target_language": "zh",  # 目标语言，默认中文
             "window_width": 800,  # 字幕窗口宽度
             "window_height": 200,   # 字幕窗口高度
+            # 窗口高度是否跟着内容自动走：True 时高度 = 上/中/下三处间隙 + 各行，
+            # 字号/行数一变窗口跟着收放。用户在设置里改过高度、或拖过窗口右下角，
+            # 这里会变成 False，之后一律按他定的高度来（多出来的空间三处平分）。
+            "window_height_auto": True,
             "subtitle_mode": "translated",  # 字幕显示模式：original=只显示原文，translated=只显示译文，both=同时显示
             "input_device": "",  # 输入设备
             "output_device": "",  # 输出设备
