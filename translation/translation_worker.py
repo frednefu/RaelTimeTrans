@@ -8,11 +8,20 @@
    必须等译文算完才显示**——这就是"原文不实时"的直接原因。
 
 改成后台线程之后，原文一识别出来就上屏，译文算好了再补上。
+
+流式识别（见 audio/simul_asr.py）之后多了一种请求：**前缀翻译**。边上屏边
+翻译同一句话的半截原文（kind="prefix"），定稿后再翻整句（kind="final"）。
+两者走同一个线程、同一个队列，靠 kind 区分；关键是积压时**优先保终稿**——
+把终稿丢掉只翻前缀的话，那句的正式译文就永远不来了。
 """
 
 import itertools
 import queue
 import threading
+
+# 前缀请求与终稿请求的标签（kind）
+KIND_PREFIX = "prefix"
+KIND_FINAL = "final"
 
 
 class TranslationWorker:
@@ -50,15 +59,19 @@ class TranslationWorker:
         if thread and thread.is_alive():
             thread.join(timeout=1)
 
-    def request(self, text, target_language):
-        """提交一次翻译请求，返回请求序号"""
+    def request(self, text, target_language, kind=KIND_FINAL):
+        """提交一次翻译请求，返回请求序号
+
+        kind="prefix" 表示这是流式识别过程中"已确认前缀"的半截句子（只喂显示），
+        kind="final" 是定稿的整句（要落盘、要覆盖前缀译文）。
+        """
         self.start()
         seq = next(self._counter)
-        self._requests.put((seq, text, target_language))
+        self._requests.put((seq, text, target_language, kind))
         return seq
 
     def poll(self):
-        """取出已完成的翻译结果，返回 [(seq, text, translation), ...]"""
+        """取出已完成的翻译结果，返回 [(seq, text, translation, kind), ...]"""
         results = []
         while True:
             try:
@@ -69,7 +82,7 @@ class TranslationWorker:
     def _run(self):
         while self._running:
             try:
-                seq, text, target = self._requests.get(timeout=0.2)
+                request = self._requests.get(timeout=0.2)
             except queue.Empty:
                 continue
 
@@ -82,14 +95,20 @@ class TranslationWorker:
                 except queue.Empty:
                     break
             if pending:
-                self.skipped_requests += len(pending)
-                seq, text, target = pending[-1]
-                print(f"翻译积压，跳过 {len(pending)} 条较旧的文本，只翻译最新的")
+                # 终稿优先：同一批里只要有终稿就翻最后那条终稿。终稿要是被前缀
+                # 挤掉，这一句就没有正式译文了（前缀文本短一截，还会被界面丢掉）。
+                finals = [item for item in pending if item[3] == KIND_FINAL]
+                keep = finals[-1] if finals else pending[-1]
+                self.skipped_requests += len(pending) - 1
+                print(f"翻译积压，跳过 {len(pending) - 1} 条较旧的文本，"
+                      f"只翻译最新的{'终稿' if finals else '前缀'}")
+                request = keep
 
+            seq, text, target, kind = request
             try:
                 translation = self._translate(text, target)
             except Exception as e:
                 print(f"后台翻译失败: {str(e)}")
                 translation = ""
 
-            self._results.put((seq, text, translation))
+            self._results.put((seq, text, translation, kind))

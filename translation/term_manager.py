@@ -157,23 +157,31 @@ class TermManager:
         words = text.lower().split()
         result = []
         i = 0
-        
+
+        def _digit(word):
+            """查表前先把词尾的标点剥掉：'nine.' / 'nine,' 也是 9
+
+            不剥的话 "five by nine." 这种**句末**的信号报告（很常见）凑不齐两位数字，
+            整段就换不成 59 了。
+            """
+            return num_map.get(word.strip('.,!?;:，。！？；：'))
+
         while i < len(words):
             # 检查是否为信号报告的数字单词序列
-            if words[i] in num_map:
+            if _digit(words[i]) is not None:
                 digits = []
                 j = i
                 # 收集连续的数字单词
-                while j < len(words) and words[j] in num_map and len(digits) < 3:
-                    digits.append(num_map[words[j]])
+                while j < len(words) and _digit(words[j]) is not None and len(digits) < 3:
+                    digits.append(_digit(words[j]))
                     j += 1
-                
+
                 # 如果收集到至少两个数字，则视为信号报告
                 if len(digits) >= 2:
                     result.append(''.join(digits))
                     i = j
                     continue
-            
+
             # 如果不是信号报告的一部分，保持原样
             result.append(words[i])
             i += 1

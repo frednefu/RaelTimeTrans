@@ -40,6 +40,18 @@ logger.addHandler(file_handler)
 # 用于存储识别结果和时间信息的数据结构
 RecognitionResult = namedtuple('RecognitionResult', ['text', 'language', 'delay_ms'])
 
+# 流式识别线程的输入事件（录音线程 → 流式线程，见 _stream_recognize）：
+#   begin —— 新的一句话开始，offset_sec 是这句话第一块音频的绝对时间（秒），
+#            audio 是语音起点前后已经攒下的几块音频（不能从第一个词中间开始喂）
+#   chunk —— 又采集到一块音频
+#   end   —— 这句话说完了，可以定稿
+#   stop  —— 停机：定稿（如果还有没结束的句子）后线程退出
+_StreamEvent = namedtuple('_StreamEvent', ['kind', 'utterance_id', 'offset_sec', 'audio'])
+
+# 语音起点前多喂几块（1 块 ≈ 64ms）。检测"语音开始"要连续两帧，起点其实在第一帧
+# 之前，不往回带一点的话第一个词会被切掉半个。
+_STREAM_PREROLL_CHUNKS = 8
+
 # 逐词字幕的时间轴：TimedWord / WordSegment / AudioSegmentTask 定义在
 # audio_timeline 里（时间一律用"采集块号"，1 块 ≈ 64ms），见该模块的说明。
 
@@ -203,6 +215,21 @@ class AudioManager:
         self.word_queue = deque(maxlen=16)
         # 预览识别是否正在跑（同一时刻只允许一个，绝不排队）
         self._partial_inflight = False
+
+        # ── 流式识别（SimulStreaming，见 audio/simul_asr.py）────────────────
+        # asr_backend="simul" 时走这条路：录音线程把每一块音频喂给流式引擎，
+        # 引擎按提交间隔给出"已确认前缀"，句尾再定稿。整句识别那条路（线程池、
+        # audio_queue）在流式模式下完全不参与；引擎起不来就自动退回整句识别。
+        self.asr_backend = config.get("asr_backend", "whisper_batch")
+        self.stream_engine = None        # SimulStreamingEngine（未启用时 None）
+        self.stream_thread = None
+        self.stream_queue = queue.Queue()
+        # "starting"（正在加载模型）/"ready"/"failed"（起不来，退回整句识别）
+        self._stream_state = "starting"
+        # 最近一次已确认前缀：(utterance_id, 文本)，界面轮询拿去翻译
+        self._committed_prefix = (None, "")
+        self._committed_lock = threading.Lock()
+        self.stream_error = None         # 流式不可用的原因（界面要显示）
 
 
         # 从配置文件读取模型设置
@@ -489,6 +516,10 @@ class AudioManager:
         self.word_queue.clear()
         self._partial_inflight = False
 
+        # 流式识别：后端在"开始翻译"时定下来（运行中改设置要重开才生效）
+        self.asr_backend = config.get("asr_backend", "whisper_batch")
+        self._prepare_streaming()
+
         # 提取设备索引（按名字重新匹配，不信任标签里的旧索引）
         try:
             self.input_device_index = self.resolve_device_index(input_device, want_input=True)
@@ -516,6 +547,9 @@ class AudioManager:
         self.recording_thread.start()
         
         # 启动识别线程 - 只负责从队列获取音频并进行识别
+        # 流式模式下它虽然也起来了，但 audio_queue 永远不会有任务进来（录音线程
+        # 见 _stream_state 不是 failed 就直接把音频喂给流式引擎），于是它只是空转；
+        # 这样万一引擎中途崩了、录音线程改走整句那条路，这个线程立刻就能接上。
         self.recognition_thread = threading.Thread(target=self._recognize_audio)
         self.recognition_thread.daemon = True
         self.recognition_thread.start()
@@ -710,7 +744,8 @@ class AudioManager:
         # 停止字幕记录
         self.subtitle_manager.stop_recording()
 
-        # 等待线程结束
+        # 等待线程结束。录音线程先停：它停了就不会再往流式队列里塞东西，
+        # 下面那次收尾才一定是队列里的最后一条事件。
         for thread in [self.recording_thread, self.recognition_thread]:
             if thread and thread.is_alive():
                 try:
@@ -720,6 +755,14 @@ class AudioManager:
                         print(f"线程 {thread.name} 超时未结束")
                 except Exception as e:
                     print(f"等待线程结束时出错: {str(e)}")
+
+        # 流式识别线程：让它把手上这句话定稿（不定稿最后一句会丢），再等它退出
+        self._stop_streaming()
+        if self.stream_thread and self.stream_thread.is_alive():
+            try:
+                self.stream_thread.join(timeout=2)
+            except Exception as e:
+                print(f"等待流式识别线程结束时出错: {str(e)}")
         
         # 确保音频处理器的线程池停止
         if hasattr(self.audio_processor, 'thread_pool'):
@@ -750,6 +793,7 @@ class AudioManager:
             partial_interval = max(0.3, config.get("partial_interval_ms", 1000) / 1000.0)
 
             print(f"音频设置: 监听={monitor_enabled}, 逐词显示={word_by_word}"
+                  f", 识别后端={'流式 SimulStreaming' if self.asr_backend == 'simul' else '整句 Whisper'}"
                   + (f", 预览识别间隔={partial_interval:.1f}秒" if word_by_word else ""))
             
             # 创建音频流
@@ -801,6 +845,12 @@ class AudioManager:
             # 语音分段参数
             max_record_seconds = 7.0  # 最长一段音频，超过就强制切（Whisper 的窗口是 30 秒）
             min_record_seconds = 1.0  # 一段至少要有这么长才值得送去识别
+            if self.asr_backend == "simul":
+                # 流式：引擎自己攒着整句的上下文，不靠"整段一起交"来拿准确率，
+                # 所以句子可以判得短一些（短句也能定稿，终稿早一点、前缀译文早点被
+                # 正式译文替换掉），最长也放宽——边说边出的句子说 25 秒也没关系。
+                min_record_seconds = max(0.5, config.get("simul_min_chunk_ms", 600) / 1000.0)
+                max_record_seconds = float(config.get("simul_max_utterance_sec", 25))
 
             # 静音检测参数
             silence_duration_for_break = 0.5  # 连续静音超过这个时长就认为一句话说完了
@@ -834,6 +884,9 @@ class AudioManager:
 
             # 是否有足够音量的标志
             has_sufficient_volume = False
+
+            # 流式识别：刚检测到语音起点，等这一块进了缓冲区再开喂（见下面那段）
+            stream_begin_pending = False
 
             # 静音检测参数
             silence_frames = 0
@@ -898,6 +951,8 @@ class AudioManager:
                             speech_detected = True
                             # 新的一句话：编号加一，这一句的预览/最终结果都归到它名下
                             utterance_id += 1
+                            # 流式识别：这一块还没进缓冲区，等进去了再喂（起点才准）
+                            stream_begin_pending = True
                         if speech_detected:
                             silence_frames = 0  # 重置静音计数
                             has_sufficient_volume = True
@@ -944,6 +999,22 @@ class AudioManager:
                         if DEBUG_MODE and frame_count % 500 == 0:
                             print(f"缓冲区过大，已移除最早的 {removed_duration:.2f} 秒数据")
 
+                    # ── 流式识别：把这一块喂给引擎 ─────────────────────────
+                    # 起点必须是**真正喂进去的第一块**的绝对位置：词时间由引擎按
+                    # 那个 offset 算成绝对流时间，错一块就是 64ms 的画面偏移。
+                    if self._stream_live():
+                        if stream_begin_pending:
+                            stream_begin_pending = False
+                            start_index = max(
+                                0, len(recognition_buffer) - 1 - _STREAM_PREROLL_CHUNKS)
+                            self._stream_begin(
+                                utterance_id,
+                                (buffer_start_chunk + start_index)
+                                * self.chunk_size / self.sample_rate,
+                                recognition_buffer[start_index:])
+                        else:
+                            self._stream_chunk(audio_float)
+
                     # ── 预览识别：说话过程中先看个大概 ────────────────────────
                     # 整句识别要等 0.5 秒静音才提交，等结果回来这句话早播完了，
                     # 所以整句结果只能"一下子全冒出来"。要让字幕一个词一个词跟着
@@ -951,8 +1022,13 @@ class AudioManager:
                     # 预览只喂逐词显示（绝不进字幕文件、不触发翻译），
                     # 最终结果到达时会把这一段整句替换掉。
                     # 开关每帧重读：正在跑的时候勾掉/勾上就生效，不用重开
+                    #
+                    # 流式识别模式下整段跳过：引擎本身就是"边说边出"，比这种
+                    # "每隔一秒把整段重识别一遍"又快又准；而且跑预览会把整句
+                    # 模型也加载进来，白白多占一份显存。
                     word_by_word = config.get("word_by_word_enabled", True)
-                    if (word_by_word and speech_detected and silence_frames == 0
+                    if (not self._stream_live()
+                            and word_by_word and speech_detected and silence_frames == 0
                             and recognition_buffer_duration >= 1.0
                             and self.audio_queue.qsize() < 2
                             and current_time - last_partial_time >= partial_interval):
@@ -987,6 +1063,12 @@ class AudioManager:
                     stalled_submit = (has_sufficient_volume and
                                       recognition_buffer_duration >= 4.0 and
                                       time_since_last_submission > 4.0)
+                    if self._stream_live():
+                        # 流式不需要这条兜底：字幕本来就是边走边出，不存在"长时间
+                        # 不更新"；而每 4 秒硬切一刀会把连着的句子劈成两半，接缝
+                        # 处还要丢两块（重新检测语音起点）。长句交给
+                        # simul_max_utterance_sec 兜着就行。
+                        stalled_submit = False
 
                     # 每300帧打印一次分段状态
                     if speech_detected and frame_count % 300 == 0:
@@ -994,60 +1076,78 @@ class AudioManager:
 
                     # 根据上述条件决定是否提交音频
                     if max_duration_reached or sentence_end_detected or stalled_submit:
-                        # 合并音频数据
-                        recognition_data = np.concatenate(recognition_buffer)
-
-                        audio_length_sec = len(recognition_data) / self.sample_rate
-                        audio_max_volume = float(np.max(np.abs(recognition_data)))
-                        # 用整段 RMS 判断"有没有人说话"，而不是峰值：
-                        # 峰值会被单个脉冲（例如流打开时的爆音）带过去，
-                        # 于是一段几乎全静的音频也被送去识别并触发幻觉。
-                        audio_rms = float(np.sqrt(np.mean(np.square(recognition_data))))
-                        print(f"准备处理音频段: 长度={audio_length_sec:.2f}秒, 峰值={audio_max_volume:.4f}, "
-                              f"RMS={audio_rms:.5f}, 有语音帧数={voiced_frames_in_segment}")
-
-                        submitted = False
-                        if not has_sufficient_volume or voiced_frames_in_segment < 2:
-                            # 整段都没检测到语音：直接丢弃，不送识别。
-                            # 这类音频交给 Whisper 只会换来幻觉文本。
-                            print(f"音频片段内未检测到语音，丢弃 ({audio_length_sec:.2f}秒)")
-                            submitted = True  # 已经"处理"过了，需要清空缓冲区
-                        elif audio_rms < 0.0015:
-                            # RMS 太低说明基本是噪声底噪，识别出来也没意义
-                            print(f"音频片段 RMS 过低 ({audio_rms:.5f})，丢弃")
+                        if self._stream_live():
+                            # 流式：这段音频早就一块块喂给引擎了，这里只需告诉它
+                            # "这句话说完了"，让它定稿。不作 RMS/语音帧数的丢弃判断——
+                            # 有没有内容是引擎自己判的（没词就什么都不出），
+                            # 而这条音频已经进过引擎了，丢掉判断反而更一致。
+                            if speech_detected:
+                                print(f"流式识别：第{utterance_id}句结束"
+                                      f"（{recognition_buffer_duration:.2f}秒），提交定稿")
+                                self._stream_end(utterance_id)
+                            else:
+                                # 一句话说完之后一直没人说话，缓冲区单靠静音攒到了
+                                # max_utterance_sec：这一轮没有语音起点，引擎那边
+                                # 压根没开始跟（begin 只在语音起点发），没什么可定稿的。
+                                # 只清缓冲区，别去惊动引擎。
+                                print(f"静音攒到上限（{recognition_buffer_duration:.2f}秒），"
+                                      f"这一轮没有语音，不提交")
                             submitted = True
                         else:
-                            try:
-                                # 带上这段音频在采集时间轴上的位置，识别回来后才
-                                # 知道"这些词是在什么时候说的"
-                                task = AudioSegmentTask(
-                                    data=recognition_data,
-                                    submit_time=time.time(),
-                                    start_chunk=buffer_start_chunk,
-                                    end_chunk=buffer_end_chunk,
-                                    utterance_id=utterance_id,
-                                )
-                                # 队列大小限制，避免堆积太多待处理任务
-                                if self.audio_queue.qsize() < 5:
-                                    print(f"提交音频段到识别队列: 长度={audio_length_sec:.2f}秒, 队列大小={self.audio_queue.qsize()}, 峰值={audio_max_volume:.4f}")
-                                    self.audio_queue.put(task)
-                                    submitted = True
-                                    last_submission_time = time.time()
-                                else:
-                                    # 队列已满说明识别跟不上：丢弃最旧的一段，保证最新的
-                                    # 语音一定能进去（旧代码在这里直接跳过，而且下面还会把
-                                    # 缓冲区清空，等于白白丢掉一段语音）
-                                    try:
-                                        dropped = self.audio_queue.get_nowait()
-                                        self.audio_queue.task_done()
-                                        print(f"识别队列已满，丢弃最旧的一段({len(dropped.data)/self.sample_rate:.2f}秒)后提交")
-                                    except queue.Empty:
-                                        pass
-                                    self.audio_queue.put(task)
-                                    submitted = True
-                                    last_submission_time = time.time()
-                            except Exception as e:
-                                print(f"提交音频段失败: {str(e)}")
+                            # 合并音频数据
+                            recognition_data = np.concatenate(recognition_buffer)
+
+                            audio_length_sec = len(recognition_data) / self.sample_rate
+                            audio_max_volume = float(np.max(np.abs(recognition_data)))
+                            # 用整段 RMS 判断"有没有人说话"，而不是峰值：
+                            # 峰值会被单个脉冲（例如流打开时的爆音）带过去，
+                            # 于是一段几乎全静的音频也被送去识别并触发幻觉。
+                            audio_rms = float(np.sqrt(np.mean(np.square(recognition_data))))
+                            print(f"准备处理音频段: 长度={audio_length_sec:.2f}秒, 峰值={audio_max_volume:.4f}, "
+                                  f"RMS={audio_rms:.5f}, 有语音帧数={voiced_frames_in_segment}")
+
+                            submitted = False
+                            if not has_sufficient_volume or voiced_frames_in_segment < 2:
+                                # 整段都没检测到语音：直接丢弃，不送识别。
+                                # 这类音频交给 Whisper 只会换来幻觉文本。
+                                print(f"音频片段内未检测到语音，丢弃 ({audio_length_sec:.2f}秒)")
+                                submitted = True  # 已经"处理"过了，需要清空缓冲区
+                            elif audio_rms < 0.0015:
+                                # RMS 太低说明基本是噪声底噪，识别出来也没意义
+                                print(f"音频片段 RMS 过低 ({audio_rms:.5f})，丢弃")
+                                submitted = True
+                            else:
+                                try:
+                                    # 带上这段音频在采集时间轴上的位置，识别回来后才
+                                    # 知道"这些词是在什么时候说的"
+                                    task = AudioSegmentTask(
+                                        data=recognition_data,
+                                        submit_time=time.time(),
+                                        start_chunk=buffer_start_chunk,
+                                        end_chunk=buffer_end_chunk,
+                                        utterance_id=utterance_id,
+                                    )
+                                    # 队列大小限制，避免堆积太多待处理任务
+                                    if self.audio_queue.qsize() < 5:
+                                        print(f"提交音频段到识别队列: 长度={audio_length_sec:.2f}秒, 队列大小={self.audio_queue.qsize()}, 峰值={audio_max_volume:.4f}")
+                                        self.audio_queue.put(task)
+                                        submitted = True
+                                        last_submission_time = time.time()
+                                    else:
+                                        # 队列已满说明识别跟不上：丢弃最旧的一段，保证最新的
+                                        # 语音一定能进去（旧代码在这里直接跳过，而且下面还会把
+                                        # 缓冲区清空，等于白白丢掉一段语音）
+                                        try:
+                                            dropped = self.audio_queue.get_nowait()
+                                            self.audio_queue.task_done()
+                                            print(f"识别队列已满，丢弃最旧的一段({len(dropped.data)/self.sample_rate:.2f}秒)后提交")
+                                        except queue.Empty:
+                                            pass
+                                        self.audio_queue.put(task)
+                                        submitted = True
+                                        last_submission_time = time.time()
+                                except Exception as e:
+                                    print(f"提交音频段失败: {str(e)}")
 
                         if submitted:
                             # 只有真正处理过这段音频才清空缓冲区。
@@ -1195,7 +1295,9 @@ class AudioManager:
                     float(word["end"]) * self.sample_rate / self.chunk_size))
             except (KeyError, TypeError, ValueError):
                 continue
-            timed.append(TimedWord(word.get("word", ""), start, max(start, end)))
+            # 上游 whisper 给的是 "word"，SimulStreaming 给的是 "text"
+            timed.append(TimedWord(word.get("word") or word.get("text", ""),
+                                   start, max(start, end)))
         return timed
 
     def _submit_partial(self, audio_snapshot, utterance_id, start_chunk, end_chunk):
@@ -1237,6 +1339,262 @@ class AudioManager:
             # 线程池正忙着整句识别：这次预览直接跳过。预览永远不排队，
             # 否则它会排在整句结果前面，把真正的字幕往后拖。
             self._partial_inflight = False
+
+    # ── 流式识别（SimulStreaming）────────────────────────────────────────
+    # 与整句识别的分工：录音线程照样做能量 VAD（只用来定"一句话"的边界），
+    # 但音频不再攒成整段交给线程池，而是**每一块**都喂给流式引擎；引擎每攒够
+    # 一个提交间隔就给出"已确认前缀"，句尾再定稿。原理与实测数据见
+    # audio/simul_asr.py 的文件头。
+
+    def _stream_live(self):
+        """现在是否还在走流式识别（引擎没起来或崩了就是 False，退回整句识别）"""
+        return self.stream_engine is not None and self._stream_state != "failed"
+
+    def _prepare_streaming(self):
+        """按 asr_backend 准备识别通路（start_recording 里调一次）
+
+        引擎在流式线程里加载（本机约 3 秒），**不能放在这里**：start_recording 是
+        界面线程调的，卡三秒就是"点了开始翻译窗口不动"。加载期间录音线程照常把
+        音频喂进队列排着，加载完按顺序处理，一句话都不会丢。
+        """
+        self._clear_committed_prefix()
+        self.stream_error = None
+        while True:
+            try:
+                self.stream_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if self.asr_backend != "simul":
+            self.stream_engine = None
+            self.stream_thread = None
+            self._stream_state = "off"
+            return
+
+        from audio.simul_asr import SimulStreamingEngine
+        self.stream_engine = SimulStreamingEngine(
+            model=config.get("simul_model", "small"),
+            frame_threshold=config.get("simul_frame_threshold", 12),
+            commit_interval_ms=config.get("simul_commit_interval_ms", 800),
+            min_chunk_ms=config.get("simul_min_chunk_ms", 600),
+            # 语种：配置里已经是代码（"en"/"zh"…）或 "auto"，引擎就用它
+            language=config.get("source_language", "auto"),
+            audio_max_len=float(config.get("simul_max_utterance_sec", 25)) + 5.0,
+            never_fire=config.get("simul_never_fire", False),
+            max_context_tokens=config.get("simul_max_context_tokens", 0),
+        )
+        self._stream_state = "starting"
+        self.stream_thread = threading.Thread(
+            target=self._stream_recognize, name="audio-stream-recognize", daemon=True)
+        self.stream_thread.start()
+
+    def _stop_streaming(self):
+        """让流式线程把手上这句话定稿后退出（"stop"是它唯一的退出信号）
+
+        退出信号不能是"队列空了"，否则线程可能在收尾事件入队之前就抢跑退出，
+        最后那句话的终稿就丢了。
+        """
+        if self.stream_engine is None:
+            return
+        try:
+            self.stream_queue.put(_StreamEvent("stop", None, 0.0, None))
+        except Exception as e:
+            print(f"通知流式识别线程退出失败: {str(e)}")
+
+    def _stream_begin(self, utterance_id, offset_sec, blocks):
+        """新的一句话开始：告诉引擎这句话的起点，并把开头这几块音频一起喂进去"""
+        try:
+            self.stream_queue.put(_StreamEvent("begin", utterance_id, offset_sec,
+                                               list(blocks)))
+        except Exception as e:
+            print(f"流式识别开始新句失败: {str(e)}")
+
+    def _stream_chunk(self, block):
+        """喂一块音频给流式引擎"""
+        try:
+            self.stream_queue.put(_StreamEvent("chunk", None, 0.0, block))
+        except Exception as e:
+            print(f"流式识别喂音频失败: {str(e)}")
+
+    def _stream_end(self, utterance_id):
+        """这句话说完了：让引擎定稿（终稿走整句识别那条出口）"""
+        try:
+            self.stream_queue.put(_StreamEvent("end", utterance_id, 0.0, None))
+        except Exception as e:
+            print(f"流式识别收尾失败: {str(e)}")
+
+    def _stream_recognize(self):
+        """流式识别线程：加载引擎 → 按事件顺序喂音频/提交/定稿
+
+        只有它碰引擎，所以引擎内部不需要加锁。整句识别那条路（audio_queue、
+        线程池）在流式模式下全程空转；一旦这里报错，就把 _stream_state 置成
+        "failed"，录音线程下一块音频开始改走整句识别。
+        """
+        engine = self.stream_engine
+        print("流式识别线程已启动，正在加载模型（这期间采集的音频会排队等着）...")
+        if engine is None or not engine.warmup():
+            self.stream_error = (engine.last_error if engine else None) or "引擎创建失败"
+            self._stream_state = "failed"
+            print(f"流式识别起不来，本次运行自动退回整句识别：{self.stream_error}")
+            return
+
+        self._stream_state = "ready"
+        print(f"流式识别就绪: 模型={engine.model_name}, 加载={engine.load_ms}ms, "
+              f"预热={engine.warmup_ms}ms, 提交间隔={engine.commit_interval_ms}ms, "
+              f"注意力阈值={engine.frame_threshold}帧, 语种={engine.language}")
+
+        started = False            # 当前这句话引擎已经在跟了吗
+        utterance = None           # 当前这句话的编号
+        failures = 0               # 连续失败次数（连着三次说明引擎废了）
+
+        while True:
+            try:
+                event = self.stream_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if event.kind == "stop":
+                if started:
+                    self._stream_finalize(engine, utterance)
+                break
+
+            try:
+                if event.kind == "begin":
+                    started = engine.begin_utterance(event.offset_sec,
+                                                     event.utterance_id)
+                    if not started:
+                        raise RuntimeError(engine.last_error or "无法开始新句")
+                    utterance = event.utterance_id
+                    for block in event.audio or ():
+                        engine.feed(block)
+                elif event.kind == "chunk":
+                    if started:
+                        engine.feed(event.audio)
+                elif event.kind == "end":
+                    if started:
+                        self._stream_finalize(engine, utterance)
+                    started = False
+                    utterance = None
+                    self._clear_committed_prefix()
+                    continue        # 刚定过稿，这一段没有待提交的东西了
+
+                if started and engine.ready_to_commit():
+                    result = engine.commit()
+                    if result:
+                        failures = 0
+                        self._publish_stream_segment(utterance, result, is_final=False)
+                    elif engine.last_error:
+                        failures += 1
+                        if failures >= 3:
+                            raise RuntimeError(engine.last_error)
+            except Exception as e:
+                self.stream_error = f"流式识别出错：{e}"
+                self._stream_state = "failed"
+                self._clear_committed_prefix()
+                print(f"{self.stream_error}（本次运行退回整句识别）")
+                import traceback
+                traceback.print_exc()
+                return
+
+        print("流式识别线程已结束")
+
+    def _stream_finalize(self, engine, utterance_id):
+        """句尾定稿：整句话的终稿（够长的句子才有，太短或只有噪音就什么也没有）"""
+        result = engine.finalize()
+        if result is None:
+            print(f"[流式] 第{utterance_id}句没有可用结果（太短或只有噪音）")
+            return
+        self._publish_stream_segment(utterance_id, result, is_final=True)
+
+    def _stream_timed_words(self, words):
+        """流式给的是**绝对流时间**（见 audio/simul_asr 文件头第 2 条），
+        这里一步换算成采集块号，中间不用再补任何 offset。
+        """
+        scale = self.sample_rate / self.chunk_size
+        timed = []
+        for word in words or ():
+            start = int(round(float(word.start) * scale))
+            timed.append(TimedWord(word.text, start,
+                                   max(start, int(round(float(word.end) * scale)))))
+        return timed
+
+    def _publish_stream_segment(self, utterance_id, result, is_final):
+        """把流式结果送出去
+
+        前缀（is_final=False）只喂逐词显示和"边说边翻译"通道；
+        终稿（is_final=True）走和整句识别**完全一样**的出口：逐词、text_queue、
+        result_queue、字幕文件、界面刷新——所以 SRT 里永远只有整句。
+        """
+        words = self._stream_timed_words(result.words)
+        end_chunk = max(int(round(result.end_sec * self.sample_rate / self.chunk_size)),
+                        words[-1].end_chunk if words else 0)
+
+        language = getattr(self.stream_engine, "detected_language", None)
+        if language and language != "unknown":
+            self.detected_language = language
+            self._language_votes.append(language)
+
+        if words:
+            self.word_queue.append(WordSegment(
+                utterance_id=utterance_id, words=words,
+                start_chunk=words[0].start_chunk, end_chunk=end_chunk,
+                is_final=is_final, text=result.text,
+            ))
+
+        if not is_final:
+            # 前缀：给界面拿去翻译（同一句后面还会更长，终稿最后覆盖它）
+            self._set_committed_prefix(utterance_id, result.text)
+            if DEBUG_MODE:
+                print(f"[流式前缀] 第{utterance_id}句: {len(words)}个词, {result.text!r}")
+            return
+
+        self._clear_committed_prefix()
+        text = (result.text or "").strip()
+        if not text:
+            return
+
+        # 识别延迟显示成"最后一次提交花的时间"：流式没有"整句耗时"这个东西，
+        # 界面那行 [延迟: Nms] 显示单次提交的解码开销，正好反映机器跟不跟得上。
+        self.recognition_delay = self.stream_engine.last_commit_ms
+        print(f"[流式终稿] 第{utterance_id}句（{len(words)}个词）: {text}")
+
+        self.result_queue.append(RecognitionResult(
+            text=text, language=self.detected_language, delay_ms=self.recognition_delay))
+        self.text_queue.append(text)
+        # 字幕文件只认终稿
+        self.subtitle_manager.add_subtitle(text)
+        ui_update_queue.put(("text_update", text))
+
+    def _set_committed_prefix(self, utterance_id, text):
+        with self._committed_lock:
+            self._committed_prefix = (utterance_id, text or "")
+
+    def _clear_committed_prefix(self):
+        with self._committed_lock:
+            self._committed_prefix = (None, "")
+
+    def get_committed_prefix(self):
+        """当前"已确认前缀"：(utterance_id, 文本)；没有就返回 (None, "")
+
+        界面轮询它，把边说边确认下来的原文送去翻译——"译文跟着原文一起长"就是
+        这条线。它**只喂显示**：不进 text_queue、不进字幕文件、不触发整句替换。
+        """
+        with self._committed_lock:
+            return self._committed_prefix
+
+    def is_streaming(self):
+        """本次运行是否在走流式识别（引擎起不来就自动是 False，即整句识别）"""
+        return self._stream_live()
+
+    def get_stream_status(self):
+        """流式识别的状态文本（界面那行标签用）"""
+        if self.stream_engine is None:
+            return "未启用（整句识别）"
+        if self._stream_state == "failed":
+            return f"已退回整句识别：{self.stream_error or '未知原因'}"
+        if self._stream_state == "starting":
+            return "加载中…"
+        return self.stream_engine.status()
 
     def _recognize_audio(self):
         """使用Whisper模型识别音频"""

@@ -1,7 +1,7 @@
-from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                             QPushButton, QComboBox, QLabel, QSlider, QColorDialog,
                             QGroupBox, QCheckBox, QSpinBox, QFileDialog, QMessageBox,
-                            QSizePolicy)
+                            QSizePolicy, QLineEdit, QScrollArea, QFrame)
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QFont, QColor, QFontMetrics
 import os
@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication
 
 from audio.audio_manager import AudioManager, clean_device_name, display_device_name
 from translation.subtitle_manager import SubtitleManager
-from translation.translation_worker import TranslationWorker
+from translation.translation_worker import TranslationWorker, KIND_PREFIX
 from gui.subtitle_window import SubtitleWindow
 from gui.volume_meter import VolumeMeter
 from gui.word_reveal import WordReveal
@@ -30,11 +30,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("实时翻译")
-        self.setMinimumSize(800, 600)
-        
-        # 应用保存的窗口大小
+        # 一屏放不下就靠滚动条（见 `init_ui`），所以最小尺寸可以放小一点
+        self.setMinimumSize(760, 520)
+
+        # 应用保存的窗口大小。存的尺寸可能来自另一块屏（本机实测存过 897×1360，
+        # 比 1080p 屏还高），夹到当前屏幕的可用区域里，免得窗口底部永远在屏幕外。
         saved_width = config.get("main_window_width", 800)
         saved_height = config.get("main_window_height", 600)
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            saved_width = max(self.minimumWidth(), min(int(saved_width), available.width()))
+            saved_height = max(self.minimumHeight(), min(int(saved_height), available.height()))
         self.resize(saved_width, saved_height)
         
         # 初始化音频和字幕管理器
@@ -67,6 +74,20 @@ class MainWindow(QMainWindow):
         # 记录当前显示的文本，避免重复更新相同内容
         self.current_displayed_text = ""
         self.current_displayed_translation = ""
+
+        # "译文逐词"（半截句子的译文）：已经送出去的前缀请求（seq -> utterance_id）。
+        # 整句定稿一到就把整批作废——半截句子的译文回来得晚，不挡住它就会把
+        # 整句译文盖回一个更短的版本。
+        self._prefix_requests = {}
+        self._prefix_text = ""          # 上一次送翻的前缀（一样就不重复送）
+        self._prefix_request_time = 0.0
+        self._prefix_utterance = None   # 现在翻着的是第几句（上一句的译文回来了就丢）
+        # 整句识别后端的前缀来源：逐词通路这一刻已经念出来的那半句（见第 0 步）
+        self._prefix_source_utterance = None
+        self._prefix_source_text = ""
+        # 已经整句定稿的那一句的编号：它的前缀请求到此为止（不然迟到的半截译文
+        # 会盖掉刚贴上去的正式译文）
+        self._finalized_utterance = None
 
         # 逐词字幕调度：音频管理器给词表，这里按播放进度决定显示到哪个词
         self.word_reveal = WordReveal()
@@ -118,6 +139,13 @@ class MainWindow(QMainWindow):
         if DEBUG_MODE:
             print("设置检查与更新完成")
         
+    @staticmethod
+    def _fixed_label(text, width=60):
+        """固定宽度的行标签：几行的标签一样宽，右边的控件才会排在一条竖线上"""
+        label = QLabel(text)
+        label.setFixedWidth(width)
+        return label
+
     def _configure_device_combo(self, combo):
         """设备下拉框的基础配置。
 
@@ -153,11 +181,57 @@ class MainWindow(QMainWindow):
             combo.view().setMinimumWidth(width)
 
     def init_ui(self):
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
-        main_layout = QVBoxLayout(central_widget)
-        
+        # 设置项一多，整页在 1080p 上一屏放不下（底部的组直接被裁掉，用户看不到），
+        # 所以中央部件换成一个可滚动的页面：放不下时出现滚动条，而不是把内容切掉。
+        # 分组本身排成左右两列（见下面的 `columns_layout`），不常改的参数收进
+        # "高级设置"（可折叠，默认收起）——三个手段一起把页面压到一屏里。
+        page = QWidget()
+        main_layout = QVBoxLayout(page)
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)   # 页面比视口窄时跟着视口宽
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidget(page)
+        self.setCentralWidget(scroll_area)
+
+        # 开始/停止按钮：整行，贴在最上面，窗口再小也够得着
+        control_layout = QHBoxLayout()
+        self.start_button = QPushButton("开始翻译")
+        self.start_button.clicked.connect(self.toggle_translation)
+        self.preview_button = QPushButton("预览字幕")
+        self.preview_button.clicked.connect(self.preview_subtitles)
+        control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.preview_button)
+        main_layout.addLayout(control_layout)
+
+        # 左右两列：左列放"设备 + 翻译 + 预览"，右列放"识别 + 字幕样式"
+        columns_layout = QHBoxLayout()
+        left_column = QVBoxLayout()
+        right_column = QVBoxLayout()
+        columns_layout.addLayout(left_column, 1)
+        columns_layout.addLayout(right_column, 1)
+        main_layout.addLayout(columns_layout)
+
+        # 高级设置：不常改的参数（流式的提交间隔/阈值/最长句、本地服务的地址与超时、
+        # 字幕窗口尺寸）都往这里放。QGroupBox 自己可勾选，取消勾选时把里面的容器藏起来
+        # ——Qt 里勾选框不会自动折叠内容，得自己接一下 `setVisible`。
+        self.advanced_group = QGroupBox("高级设置（点标题展开）")
+        self.advanced_group.setCheckable(True)
+        self.advanced_group.setChecked(False)
+        self.advanced_group.setToolTip(
+            "平时不用动：流式的提交间隔 / 注意力阈值 / 一句话最长，本地翻译服务的地址 / "
+            "接口类型 / 单句超时，以及字幕窗口的宽高。")
+        self.advanced_container = QWidget()
+        advanced_layout = QVBoxLayout(self.advanced_container)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        advanced_group_layout = QVBoxLayout()
+        advanced_group_layout.addWidget(self.advanced_container)
+        self.advanced_group.setLayout(advanced_group_layout)
+        self.advanced_container.setVisible(False)
+        self.advanced_group.toggled.connect(self.advanced_container.setVisible)
+        main_layout.addWidget(self.advanced_group)
+        # 建组时才知道的高级设置项（流式的三个参数）也要往这个 layout 里放
+        self._advanced_layout = advanced_layout
+
         # 音频设备选择部分
         device_group = QGroupBox("音频设备设置")
         device_layout = QVBoxLayout()
@@ -302,6 +376,112 @@ class MainWindow(QMainWindow):
         
         translation_layout.addLayout(source_layout)
         translation_layout.addLayout(target_layout)
+
+        # 翻译引擎：默认本地模型（低延迟、不依赖网络），也可以切回 Google 公网接口
+        engine_layout = QHBoxLayout()
+        engine_label = QLabel("翻译引擎:")
+        engine_label.setFixedWidth(60)  # 和上面两行对齐
+        self.translation_backend_combo = QComboBox()
+        self.translation_backend_combo.addItems(["本地模型（低延迟）", "Google（网络）"])
+        self.translation_backend_combo.setCurrentText(
+            "Google（网络）" if str(config.get("translation_backend", "local")).lower() == "google"
+            else "本地模型（低延迟）")
+        self.translation_backend_combo.setToolTip(
+            "本地模型：调本机常驻的大模型（默认 EuroLLM-1.7B），实测单句 150~200ms、断网也能用；\n"
+            "Google：原来的公网免费接口，实测单句 2.1~2.7 秒，会被限流")
+        self.translation_backend_combo.currentTextChanged.connect(self.on_translation_backend_changed)
+        engine_layout.addWidget(engine_label)
+        engine_layout.addWidget(self.translation_backend_combo, 1)
+        translation_layout.addLayout(engine_layout)
+
+        # 本地模型那一摊设置：选了 Google 就整块收起来，不占地方
+        self.local_llm_box = QWidget()
+        local_layout = QVBoxLayout()
+        local_layout.setContentsMargins(0, 0, 0, 0)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._fixed_label("本地模型:"))
+        self.local_model_combo = QComboBox()
+        self.local_model_combo.setToolTip(
+            "本机推理服务里用来翻译的模型。列表来自服务本身；服务没起来时只显示配置里的那一个")
+        self.local_model_combo.currentTextChanged.connect(self.on_local_model_changed)
+        model_row.addWidget(self.local_model_combo, 1)
+        local_layout.addLayout(model_row)
+
+        url_row = QHBoxLayout()
+        url_row.addWidget(self._fixed_label("服务地址:"))
+        self.local_url_edit = QLineEdit(str(config.get("local_llm_url", "http://127.0.0.1:11434")))
+        self.local_url_edit.setToolTip(
+            "本地推理服务的地址。Ollama 默认 http://127.0.0.1:11434；\n"
+            "llama.cpp 的 llama-server 默认 http://127.0.0.1:8080（接口类型记得选 OpenAI 兼容）")
+        self.local_url_edit.editingFinished.connect(self.on_local_url_changed)
+        url_row.addWidget(self.local_url_edit, 1)
+
+        api_row = QHBoxLayout()
+        api_row.addWidget(self._fixed_label("接口类型:"))
+        self.local_api_combo = QComboBox()
+        self.local_api_combo.addItems(["Ollama", "OpenAI 兼容"])
+        self.local_api_combo.setCurrentText(
+            "OpenAI 兼容" if str(config.get("local_llm_api", "ollama")).lower() == "openai" else "Ollama")
+        self.local_api_combo.setToolTip(
+            "Ollama：Ollama 原生接口（能设模型保留时长、能看到生成速度）；\n"
+            "OpenAI 兼容：llama.cpp 的 llama-server 等用这个")
+        self.local_api_combo.currentTextChanged.connect(self.on_local_api_changed)
+        api_row.addWidget(self.local_api_combo, 1)
+
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(self._fixed_label("单句超时:"))
+        self.local_timeout_spin = QSpinBox()
+        self.local_timeout_spin.setRange(200, 60000)
+        self.local_timeout_spin.setSingleStep(250)
+        self.local_timeout_spin.setSuffix(" ms")
+        self.local_timeout_spin.setValue(int(config.get("local_llm_timeout_ms", 3000)))
+        self.local_timeout_spin.setToolTip("单句翻译等多久算失败；超时就按失败回落（返回已处理的原文）。\n"
+                                          "模型第一次加载进显存不算在内（实测 9B 要 9 秒），那一段单独走长超时")
+        self.local_timeout_spin.valueChanged.connect(self.on_local_timeout_changed)
+        timeout_row.addWidget(self.local_timeout_spin)
+        timeout_row.addStretch(1)
+
+        # 服务地址 / 接口类型 / 单句超时是装好之后就很少动的，收进"高级设置"；
+        # "本地模型"和"本地状态"留在翻译设置里（换模型、看通不通是常用动作）。
+        # 装了它们的小盒子独立出来：切到 Google 时也要一起藏起来。
+        self.local_advanced_box = QWidget()
+        local_advanced_layout = QVBoxLayout(self.local_advanced_box)
+        local_advanced_layout.setContentsMargins(0, 0, 0, 0)
+        local_advanced_layout.addLayout(url_row)
+        local_advanced_layout.addLayout(api_row)
+        local_advanced_layout.addLayout(timeout_row)
+        advanced_layout.addWidget(self.local_advanced_box)
+
+        status_row = QHBoxLayout()
+        status_row.addWidget(self._fixed_label("本地状态:"))
+        self.local_status_label = QLabel("")
+        self.local_status_label.setWordWrap(True)
+        self.local_status_label.setStyleSheet("color: #555555;")
+        status_row.addWidget(self.local_status_label, 1)
+        self.local_test_button = QPushButton("测试连接")
+        self.local_test_button.setToolTip("连一次本地服务：先把模型加载进显存（大模型要几秒），再真翻一句")
+        self.local_test_button.clicked.connect(self.on_test_local_llm)
+        status_row.addWidget(self.local_test_button)
+        local_layout.addLayout(status_row)
+
+        self.local_llm_box.setLayout(local_layout)
+        translation_layout.addWidget(self.local_llm_box)
+        # 先把配置里那个模型填进下拉框，再让界面按当前引擎决定这块要不要显示
+        self._apply_local_models([])
+        local_active = self.translation_backend_combo.currentText().startswith("本地")
+        self.local_llm_box.setVisible(local_active)
+        self.local_advanced_box.setVisible(local_active)
+
+        # 后台探活的定时器与结果槽：控件只能在界面线程碰，所以工作线程只写结果、
+        # 由这个 150ms 的定时器取回来（和主窗口轮询翻译结果的思路一致）
+        self._local_check_result = None
+        self._local_check_running = False
+        self._local_check_verbose = False
+        self._local_check_timer = QTimer(self)
+        self._local_check_timer.setInterval(150)
+        self._local_check_timer.timeout.connect(self._poll_local_check)
+
         translation_group.setLayout(translation_layout)
         
         # 字幕样式设置部分
@@ -381,6 +561,18 @@ class MainWindow(QMainWindow):
         self.word_by_word_checkbox.setChecked(config.get("word_by_word_enabled", True))
         self.word_by_word_checkbox.stateChanged.connect(self.on_word_by_word_changed)
 
+        # 逐词显示译文：原文还在往外确认的时候就把半截句子送去翻译，译文跟着一起长
+        self.translation_word_by_word_checkbox = QCheckBox("译文逐词显示")
+        self.translation_word_by_word_checkbox.setToolTip(
+            "译文跟着原文一起长：原文说到一半就先翻一次，定稿后再被整句译文覆盖。\n"
+            "流式识别用引擎的已确认前缀；整句识别用逐词通路已经念出来的半句（所以还要\n"
+            "勾着上面的「原文逐词显示」）。\n"
+            "关闭则只在整句定稿时翻一次（请求更少；用谷歌接口时译文本来就跟不上语速）。")
+        self.translation_word_by_word_checkbox.setChecked(
+            config.get("translation_word_by_word", True))
+        self.translation_word_by_word_checkbox.stateChanged.connect(
+            self.on_translation_word_by_word_changed)
+
         # 字幕窗口大小设置
         window_size_layout = QHBoxLayout()
         window_size_layout.addWidget(QLabel("窗口宽度:"))
@@ -404,20 +596,16 @@ class MainWindow(QMainWindow):
         subtitle_layout.addLayout(color_layout)
         subtitle_layout.addLayout(position_layout)
         subtitle_layout.addLayout(subtitle_mode_layout)
-        subtitle_layout.addWidget(self.word_by_word_checkbox)
-        subtitle_layout.addLayout(window_size_layout)
+        # 两个逐词开关挨着放：原文一个、译文一个，措辞对仗
+        word_by_word_layout = QHBoxLayout()
+        word_by_word_layout.addWidget(self.word_by_word_checkbox)
+        word_by_word_layout.addWidget(self.translation_word_by_word_checkbox)
+        word_by_word_layout.addStretch(1)
+        subtitle_layout.addLayout(word_by_word_layout)
+        # 窗口宽高是"设一次就不动"的，和翻译设置里那几项一起收进高级设置
+        advanced_layout.addLayout(window_size_layout)
         subtitle_group.setLayout(subtitle_layout)
-        
-        # 控制按钮部分
-        control_layout = QHBoxLayout()
-        self.start_button = QPushButton("开始翻译")
-        self.start_button.clicked.connect(self.toggle_translation)
-        self.preview_button = QPushButton("预览字幕")
-        self.preview_button.clicked.connect(self.preview_subtitles)
-        
-        control_layout.addWidget(self.start_button)
-        control_layout.addWidget(self.preview_button)
-        
+
         # 字幕预览区域
         preview_group = QGroupBox("字幕预览")
         preview_group.setObjectName("字幕预览")
@@ -445,54 +633,249 @@ class MainWindow(QMainWindow):
             preview_layout.addWidget(self.subtitle_preview)
 
         preview_group.setLayout(preview_layout)
-        
-        # 添加所有元素到主布局
-        main_layout.addWidget(device_group)
-        main_layout.addWidget(translation_group)
-        main_layout.addWidget(subtitle_group)
-        main_layout.addLayout(control_layout)
-        main_layout.addWidget(preview_group)
-        
+
+        # 组装：左列 = 设备 / 翻译 / 预览，右列 = 识别 / 字幕样式
+        left_column.addWidget(device_group)
+        left_column.addWidget(translation_group)
+        left_column.addWidget(preview_group)
+        left_column.addStretch(1)
+
         # 初始化音频设备列表
         self.populate_audio_devices()
-        
-        # 创建Whisper模型设置组
-        model_group = QGroupBox("Whisper模型设置")
-        model_layout = QVBoxLayout()
-        
-        # 模型选择
-        model_layout.addWidget(QLabel("选择模型:"))
-        self.model_combo = QComboBox()
-        self.model_combo.addItems(["tiny", "base", "small", "medium", "large"])
-        self.model_combo.setCurrentText(config.get("whisper_model", "base"))
-        self.model_combo.currentTextChanged.connect(self.on_model_changed)
-        model_layout.addWidget(self.model_combo)
-        
-        # 模型状态标签
+
+        right_column.addWidget(self._build_asr_group())
+        right_column.addWidget(subtitle_group)
+        right_column.addStretch(1)
+
+        # 应用保存的设置
+        self.apply_saved_settings()
+
+        # 更新模型状态显示
+        self.update_model_status()
+
+        # 本地翻译模型列表：开机后台问一次服务（连不上也不阻塞界面，只在状态行说明）
+        if self.translation_backend_combo.currentText().startswith("本地"):
+            self.refresh_local_models()
+
+    # 模型下拉的候选：整句后端 tiny~large，流式实测只到 medium（再大要和本地翻译
+    # 模型抢显存）。两个后端各记各的键，所以合并成一个下拉不需要迁移配置。
+    ASR_MODEL_CHOICES = {
+        "whisper_batch": (["tiny", "base", "small", "medium", "large"], "whisper_model", "base"),
+        "simul": (["tiny", "base", "small", "medium"], "simul_model", "small"),
+    }
+
+    def _asr_backend(self):
+        """当前识别后端：`whisper_batch`（整句）/ `simul`（流式）"""
+        return "simul" if config.get("asr_backend", "whisper_batch") == "simul" else "whisper_batch"
+
+    def _batch_model_name(self):
+        """整句识别当前该用的模型名
+
+        合并后的下拉在流式后端下显示的是流式模型，所以整句那套状态逻辑不能直接读
+        下拉框的文本；`whisper_model` 这个键一直在配置里，读它等价且不会拿错。
+        """
+        if self._asr_backend() == "simul":
+            return str(config.get("whisper_model", "base"))
+        return self.asr_model_combo.currentText()
+
+    def _sync_asr_model_combo(self, name):
+        """把"实际加载的整句模型"回填到下拉框（降级、超时解锁时用）
+
+        流式后端下这个下拉显示的是流式模型，回填会经信号把整句的模型名写进
+        `simul_model`，所以只在整句后端下回填。
+        """
+        if not name or self._asr_backend() == "simul":
+            return
+        self.asr_model_combo.blockSignals(True)
+        self.asr_model_combo.setCurrentText(name)
+        self.asr_model_combo.blockSignals(False)
+
+    def _populate_asr_model_combo(self):
+        """按当前后端重填模型下拉（候选和值都取那个后端自己的那一档）"""
+        models, key, default = self.ASR_MODEL_CHOICES[self._asr_backend()]
+        current = str(config.get(key, default))
+        combo = self.asr_model_combo
+        combo.blockSignals(True)   # 重填时别触发 on_asr_model_changed
+        combo.clear()
+        combo.addItems(models)
+        if current in models:
+            combo.setCurrentText(current)
+        else:
+            # 这一档里没有这个值（比如旧配置把流式模型记成了 large）：落到默认档，
+            # 顺手把配置也纠回来，免得界面上显示的和实际会加载的不一致
+            combo.setCurrentText(default)
+            config.set(key, default)
+        combo.blockSignals(False)
+
+    def on_asr_model_changed(self, model):
+        """合并后的模型下拉：写进**当前后端**那个键
+
+        整句后端沿用原来的 `on_model_changed`（立刻把模型加载进显存）；流式后端只存
+        配置——流式模型在点「开始翻译」时由 `AudioManager` 加载。
+        """
+        if self._asr_backend() == "simul":
+            config.set("simul_model", model)
+            return
+        self.on_model_changed(model)
+
+    def _build_asr_group(self):
+        """语音识别设置：整句识别（Whisper 批处理）与流式识别（SimulStreaming）合并成一组
+
+        以前分成两个组、各有一个模型下拉，看着重复；现在只有一个「识别模型」下拉，
+        候选跟着后端变（见 `ASR_MODEL_CHOICES`），值各写各的键（`whisper_model` /
+        `simul_model`），所以两边各自的模型都还记得。除模型之外的流式参数（提交间隔、
+        注意力阈值、一句话最长）以及流式的状态行，都只在流式后端下出现；后两项不常改，
+        放在"高级设置"里。
+        """
+        group = QGroupBox("语音识别设置")
+        layout = QVBoxLayout()
+
+        layout.addWidget(QLabel("识别后端:"))
+        self.asr_backend_combo = QComboBox()
+        self.asr_backend_combo.addItems(["Whisper整句(兼容)", "SimulStreaming流式"])
+        self.asr_backend_combo.setCurrentIndex(
+            1 if config.get("asr_backend", "whisper_batch") == "simul" else 0)
+        self.asr_backend_combo.setToolTip(
+            "整句：说完了才出原文（原来的行为）。\n"
+            "流式：边说边出已确认的原文前缀，译文跟着一起长。\n"
+            "改动在下次「开始翻译」时生效；流式起不来会自动退回整句识别。")
+        self.asr_backend_combo.currentIndexChanged.connect(self.on_asr_backend_changed)
+        layout.addWidget(self.asr_backend_combo)
+
+        layout.addWidget(QLabel("识别模型:"))
+        self.asr_model_combo = QComboBox()
+        self.asr_model_combo.setToolTip(
+            "两种识别各记各的模型（整句默认 base、流式默认 small）：切后端时这个下拉会\n"
+            "换成那个后端的候选，改哪边只动哪边的配置。\n"
+            "整句改完立刻加载进显存；流式的在下次「开始翻译」时加载。")
+        self.asr_model_combo.currentTextChanged.connect(self.on_asr_model_changed)
+        layout.addWidget(self.asr_model_combo)
+
+        # 整句的加载状态（"模型已下载 / 当前使用…"）只在整句后端下有话可说
+        self._batch_status_box = QWidget()
+        batch_status_layout = QHBoxLayout(self._batch_status_box)
+        batch_status_layout.setContentsMargins(0, 0, 0, 0)
+        batch_status_layout.addWidget(self._fixed_label("识别状态:"))
         self.model_status_label = QLabel()
         self.model_status_label.setStyleSheet("margin-top: 5px;")
-        model_layout.addWidget(self.model_status_label)
-        
-        # GPU设置
+        batch_status_layout.addWidget(self.model_status_label, 1)
+        layout.addWidget(self._batch_status_box)
+
+        # GPU设置（两种后端都吃这个开关：都在这台机器上跑 whisper）
         self.gpu_check = QCheckBox("使用GPU加速")
         self.gpu_check.setChecked(config.get("use_gpu", True))
         self.gpu_check.stateChanged.connect(self.on_gpu_changed)
-        model_layout.addWidget(self.gpu_check)
-        
-        # 打开模型文件夹按钮
+        layout.addWidget(self.gpu_check)
+
+        # 打开模型文件夹按钮（两边的模型都缓存在 ~/.cache/whisper）
         self.open_model_dir_button = QPushButton("打开模型文件夹")
         self.open_model_dir_button.clicked.connect(self.open_model_folder)
-        model_layout.addWidget(self.open_model_dir_button)
-        
-        model_group.setLayout(model_layout)
-        main_layout.addWidget(model_group)
-        
-        # 应用保存的设置
-        self.apply_saved_settings()
-        
-        # 更新模型状态显示
-        self.update_model_status()
-        
+        layout.addWidget(self.open_model_dir_button)
+
+        # ── 只在流式后端下显示的那几行 ────────────────────────────────
+        self._stream_group = QWidget()
+        stream_layout = QVBoxLayout(self._stream_group)
+        stream_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.stream_status_label = QLabel()
+        self.stream_status_label.setStyleSheet("margin-top: 5px;")
+        self.stream_status_label.setWordWrap(True)
+        stream_layout.addWidget(self.stream_status_label)
+        self._stream_status_text = None
+
+        layout.addWidget(self._stream_group)
+
+        # 流式那三个不常改的参数：进"高级设置"，也只在流式后端下显示
+        self._stream_advanced_box = QWidget()
+        stream_advanced_layout = QVBoxLayout(self._stream_advanced_box)
+        stream_advanced_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.simul_commit_spin = self._add_stream_spin(
+            stream_advanced_layout, "提交间隔(ms):", "simul_commit_interval_ms", 800, 200, 5000, 100,
+            "攒够这么多毫秒的音频才解码一次。\n小 = 出字更快、更吃显卡；大 = 省显卡，"
+            "但原文一段段往外蹦的间隔更长。")
+        self.simul_threshold_spin = self._add_stream_spin(
+            stream_advanced_layout, "注意力阈值(帧):", "simul_frame_threshold", 12, 4, 48, 1,
+            "离音频末尾这么近的帧不解码（末尾没把握的词一律截断）。\n"
+            "大 = 更稳、字延迟更大。上游命令行默认 25；实测 12 的最长字延迟 0.63 秒、"
+            "25 是 0.95 秒。")
+        self.simul_max_utt_spin = self._add_stream_spin(
+            stream_advanced_layout, "一句话最长(秒):", "simul_max_utterance_sec", 25, 5, 60, 1,
+            "一直不停口时，说满这么多秒就强行收一句。\n"
+            "注意每次提交都要重新编码当前这段音频：句子越长，单次提交越慢。")
+        self._advanced_layout.addWidget(self._stream_advanced_box)
+
+        # 前缀翻译的节流间隔两种后端都要用（见 `translation_word_by_word`），所以放在
+        # 流式那两块**外面**，切回整句后端也还在
+        self.simul_prefix_spin = self._add_stream_spin(
+            self._advanced_layout, "译文刷新间隔(ms):", "simul_prefix_interval_ms",
+            800, 200, 3000, 100,
+            "「译文逐词显示」开着时，最短隔多久把新认出来的半截原文送去翻译一次。\n"
+            "定稿的整句永远会翻，不受这个限制。")
+
+        group.setLayout(layout)
+        # 先把后端自己那一档的模型填进下拉，再按后端决定流式那几行显不显示
+        self._populate_asr_model_combo()
+        self.update_stream_status()
+        self._update_stream_controls_enabled()
+        return group
+
+    def _add_stream_spin(self, layout, label, key, default, low, high, step, tip):
+        """流式设置里的一行（标签 + spinbox），改动写回 config"""
+        layout.addWidget(QLabel(label))
+        spin = QSpinBox()
+        spin.setRange(low, high)
+        spin.setSingleStep(step)
+        spin.setValue(int(config.get(key, default)))
+        spin.setToolTip(tip)
+        spin.valueChanged.connect(lambda value, k=key: config.set(k, value))
+        layout.addWidget(spin)
+        return spin
+
+    def on_asr_backend_changed(self, index):
+        """识别后端切换（整句 / 流式）"""
+        config.set("asr_backend", "simul" if index == 1 else "whisper_batch")
+        # 两个后端各记各的模型：下拉换成新后端的候选和值
+        self._populate_asr_model_combo()
+        self._update_stream_controls_enabled()
+        self.update_stream_status()
+
+    def on_translation_word_by_word_changed(self, state):
+        """「译文逐词显示」开关：写配置，并把还在路上的半截译文作废
+
+        关掉时那批前缀请求已经没有意义了（结果也要丢，见 `update_subtitles` 第 2 步），
+        打开时从下一句的下一段开始生效。
+        """
+        config.set("translation_word_by_word", bool(state))
+        self._prefix_requests.clear()
+        self._prefix_text = ""
+        self._prefix_source_text = ""
+
+    def _update_stream_controls_enabled(self):
+        """按识别后端显示/隐藏流式相关的几行（值都留着，切回流式即恢复）
+
+        以前是把流式那几项灰掉——灰掉的行照样占着地方，看着还像"再点点就能用"；
+        现在整块收起来，整句后端下这一组只剩"后端 + 模型 + 状态 + GPU + 打开文件夹"。
+        整句的加载状态反过来只在整句后端下显示（那时跑的是另一个模型，说了也没用）。
+        译文刷新间隔不在这一组里：两种后端都吃（见 `_build_asr_group`）。
+        """
+        streaming = self._asr_backend() == "simul"
+        for widget in (self._stream_group, self._stream_advanced_box):
+            widget.setVisible(streaming)
+        self._batch_status_box.setVisible(not streaming)
+
+    def update_stream_status(self):
+        """刷新"流式状态"标签（200ms 轮询里调；文本没变就不动界面）"""
+        if not hasattr(self, "stream_status_label"):
+            return
+        if not self.audio_manager.is_running:
+            text = "状态: 未运行"
+        else:
+            text = "状态: " + self.audio_manager.get_stream_status()
+        if text != getattr(self, "_stream_status_text", None):
+            self._stream_status_text = text
+            self.stream_status_label.setText(text)
+
     def closeEvent(self, event):
         """窗口关闭事件处理"""
         try:
@@ -707,6 +1090,11 @@ class MainWindow(QMainWindow):
         self.word_reveal.reset()
         self.audio_manager.take_word_segments()
         self.subtitle_window.reset_reveal_layout()
+
+        # 整句后端的前缀来源就是这些片段（见 `update_subtitles` 第 0 步）：
+        # 关掉逐词之后它没有新的半句可取，手里这份也就过期了
+        self._prefix_source_utterance = None
+        self._prefix_source_text = ""
 
     def on_monitor_changed(self, state):
         """监听选项变更时的处理"""
@@ -987,6 +1375,13 @@ class MainWindow(QMainWindow):
             # 下次开始时按新文本重新刷新，避免沿用上一轮的"当前文本"判断
             self.current_displayed_text = ""
             self.current_displayed_translation = ""
+            # 上一轮的前缀翻译请求一并作废
+            self._prefix_requests.clear()
+            self._prefix_text = ""
+            self._prefix_source_utterance = None
+            self._prefix_source_text = ""
+            self._finalized_utterance = None
+            self.update_stream_status()
 
             # 恢复输入音量监听
             self._refresh_input_monitor()
@@ -1067,6 +1462,10 @@ class MainWindow(QMainWindow):
         if word_by_word:
             for segment in self.audio_manager.take_word_segments():
                 self.word_reveal.add_segment(segment)
+                if getattr(segment, "is_final", False):
+                    # 这一句整句定稿了（词表和整句文本是同一次回调里发出来的）：
+                    # 它的"半截译文"到此为止，见 `_update_prefix_translation`
+                    self._finalized_utterance = segment.utterance_id
 
             line = self.word_reveal.tick_line(self.audio_manager.get_play_position_chunks())
             if line:
@@ -1075,6 +1474,10 @@ class MainWindow(QMainWindow):
                 # previous_text 一并带上：显示在上一行当上下文（两行原文）
                 self.subtitle_window.set_original_words(
                     line.text, line.previous_text, line.utterance_id)
+                # 整句识别后端没有"已确认前缀"可取（整句要等静音才提交），它的前缀
+                # 就是这里已经念出来的半句——勾了「译文逐词显示」时拿去翻
+                self._prefix_source_utterance = line.utterance_id
+                self._prefix_source_text = line.text
 
         # 1) 有新识别结果：原文立即上屏，并把翻译丢给后台线程
         text = self.audio_manager.get_latest_text()
@@ -1082,6 +1485,10 @@ class MainWindow(QMainWindow):
         if text and text != self.current_displayed_text:
             self.current_displayed_text = text
             self.current_displayed_translation = ""
+            # 整句定稿到了：半截句子的前缀译文全部作废（它们回来得晚，不挡住就会
+            # 把整句译文盖回一个更短的版本）
+            self._prefix_requests.clear()
+            self._prefix_text = ""
 
             print(f"新识别文本: '{text[:30]}...'")
             # 逐词模式下原文行归第 0 步的逐词通道管，整句只用来去重、翻译和落盘，
@@ -1105,19 +1512,107 @@ class MainWindow(QMainWindow):
                 self.translation_worker.request(text, target_language)
 
         # 2) 收取后台翻译结果（可能一次收到多条，这里都会处理）
-        for _seq, src_text, translation in self.translation_worker.poll():
+        for _seq, src_text, translation, kind in self.translation_worker.poll():
             if not translation:
                 continue
-            # 不管是不是当前显示的那条，都记进字幕管理器（SRT 落盘用）
+            if kind == KIND_PREFIX:
+                # 半截句子的译文：只上屏。开关已经关掉、或这一句已经定稿（请求被
+                # 作废）就丢掉。
+                utterance_id = self._prefix_requests.pop(_seq, None)
+                if not config.get("translation_word_by_word", True):
+                    print("译文逐词已关闭，丢弃半截译文")
+                    continue
+                if utterance_id is None:
+                    print("前缀译文已过期（这一句已定稿），不显示")
+                    continue
+                if utterance_id != self._prefix_utterance:
+                    # 已经换句了：屏幕上原文行是下一句的词，把上一句的译文贴上去
+                    # 就是"译文和原文不是同一句"（下一段前缀译文马上就到）
+                    print(f"前缀译文属于上一句（第{utterance_id}句），不显示")
+                    continue
+                self._apply_prefix_translation(utterance_id, translation)
+                continue
+            # 整句译文：不管是不是当前显示的那条，都记进字幕管理器（SRT 落盘用）
             self.audio_manager.add_translated_text(src_text, translation)
             if src_text == self.current_displayed_text:
                 self._apply_translation(src_text, translation)
             else:
                 print(f"翻译结果已过期，不显示: '{src_text[:20]}...'")
 
-        # 3) 更新语言识别标签和延迟信息
+        # 3) "译文逐词"：原文还在往外确认的时候，先把半截句子送去翻译
+        #    （译文跟着原文一起长；定稿后由上面那条整句译文覆盖）
+        self._update_prefix_translation()
+
+        # 4) 更新语言识别标签和延迟信息
         self.update_detected_language_label()
         self.update_delay_info()
+        self.update_stream_status()
+
+    def _update_prefix_translation(self):
+        """「译文逐词显示」：把还没定稿的半截原文送去翻译
+
+        来源按识别后端二选一：
+
+        - **流式**：引擎给出的"已确认前缀"（`get_committed_prefix`，只会往后长）；
+        - **整句**：逐词通路这一刻已经念出来的那半句（`_prefix_source_text`，第 0 步
+          记下的）。整句识别要等 0.5 秒静音才提交，等结果回来这句话早播完了，
+          所以**不勾「原文逐词显示」时整句后端根本没有半截文本**，这条路不发请求。
+
+        前缀译文**只上屏**：不进字幕文件、不进 text_queue、不参与整句替换——半截
+        句子的译文只是让眼睛早点看到意思，正式译文由整句定稿那条路覆盖。
+        """
+        if not config.get("translation_word_by_word", True):
+            return
+
+        if self._asr_backend() == "simul":
+            utterance_id, prefix = self.audio_manager.get_committed_prefix()
+        else:
+            utterance_id = self._prefix_source_utterance
+            prefix = self._prefix_source_text
+
+        if not prefix:
+            self._prefix_text = ""
+            return
+        if utterance_id is None or utterance_id == self._finalized_utterance:
+            # 这一句已经整句定稿了（正式译文在路上或已到），半截的版本再送就是
+            # 白翻一趟，回来还可能把正式译文盖掉
+            return
+        if prefix == self._prefix_text:
+            # 还在同一段（没有新认出来的词），不重复送
+            return
+
+        target_language = self.target_language_combo.currentText()
+        if target_language == "不翻译":
+            return
+
+        now = time.time()
+        interval = max(0.2, config.get("simul_prefix_interval_ms", 800) / 1000.0)
+        if now - self._prefix_request_time < interval:
+            return
+
+        self._prefix_text = prefix
+        self._prefix_request_time = now
+        self._prefix_utterance = utterance_id
+
+        if self._is_same_language(prefix):
+            # 源语言就是目标语言：不用翻（和整句那条路一样，直接拿原文当译文）
+            self._apply_prefix_translation(utterance_id, prefix)
+            return
+
+        seq = self.translation_worker.request(prefix, target_language,
+                                              kind=KIND_PREFIX)
+        self._prefix_requests[seq] = utterance_id
+        print(f"提交前缀翻译（第{utterance_id}句）: '{prefix[:30]}...'")
+
+    def _apply_prefix_translation(self, utterance_id, translation):
+        """前缀译文上屏（只更新译文行）"""
+        if not translation:
+            return
+        print(f"前缀译文（第{utterance_id}句）: '{translation[:30]}...'")
+        if self.subtitle_preview.isVisible():
+            self.subtitle_preview.setText(translation)
+        if self.subtitle_window.isVisible():
+            self.subtitle_window.update_text(translation_text=translation)
 
     def _show_original_text(self, text):
         """把原文立刻显示到预览区和字幕窗口（不等翻译）"""
@@ -1128,13 +1623,13 @@ class MainWindow(QMainWindow):
             print("字幕窗口不可见，跳过原文显示")
             return
 
-        subtitle_mode = config.get("subtitle_mode", "translated")
-        if subtitle_mode == "translated":
-            # 仅显示译文模式下，原文标签是隐藏的，先把原文填到译文行上，
-            # 这样用户马上就能看到内容，等译文回来再替换
-            self.subtitle_window.update_text(original_text=text)
-        else:
-            self.subtitle_window.update_text(original_text=text, translation_text="")
+        if config.get("subtitle_mode", "translated") == "translated":
+            # "仅显示译文"：屏幕上只许有译文。以前这里会把原文先填进译文行"顶一下"，
+            # 于是用户先看到一句原文——还穿着译文的颜色和字号——等译文回来再被顶掉。
+            # 那一行现在宁可空着（勾了「译文逐词显示」的话，译文会跟着语音一段段长）。
+            return
+
+        self.subtitle_window.update_text(original_text=text, translation_text="")
 
     def _apply_translation(self, text, translation):
         """译文就绪：更新预览区和字幕窗口"""
@@ -1291,7 +1786,7 @@ class MainWindow(QMainWindow):
         self.model_status_label.setStyleSheet("color: blue;")
         
         # 禁用模型选择和按钮，避免用户重复操作
-        self.model_combo.setEnabled(False)
+        self.asr_model_combo.setEnabled(False)
         self.open_model_dir_button.setEnabled(False)
         
         # 创建异步任务加载模型
@@ -1436,7 +1931,7 @@ class MainWindow(QMainWindow):
             print(f"UI更新前状态: model_loading={self.model_loading}, complete={self.model_loading_complete}, 模型={self.current_loading_model}")
             
             # 立即更新UI状态
-            self.model_combo.setEnabled(True)
+            self.asr_model_combo.setEnabled(True)
             self.open_model_dir_button.setEnabled(True)
             
             # 标记加载完成
@@ -1457,10 +1952,8 @@ class MainWindow(QMainWindow):
                 if actual_model_name and actual_model_name != model_name:
                     self.model_status_label.setText(f"模型 {model_name} 已降级到 {actual_model_name}")
                     self.model_status_label.setStyleSheet("color: orange;")
-                    # 更新下拉框选择
-                    self.model_combo.blockSignals(True)
-                    self.model_combo.setCurrentText(actual_model_name)
-                    self.model_combo.blockSignals(False)
+                    # 更新下拉框选择（流式后端下这个下拉显示的是流式模型，不会回填）
+                    self._sync_asr_model_combo(actual_model_name)
                     # 显示警告
                     QMessageBox.warning(self, "模型降级", 
                                     f"模型 {model_name} 已降级为 {actual_model_name}")
@@ -1592,6 +2085,115 @@ class MainWindow(QMainWindow):
         if DEBUG_MODE:
             print(f"目标语言切换到: {language} (代码: {lang_code})")
 
+    # ------------------------------------------------------- 本地翻译模型设置
+
+    def on_translation_backend_changed(self, text):
+        """切换翻译引擎：本地模型 / Google"""
+        backend = "google" if text.startswith("Google") else "local"
+        config.set("translation_backend", backend)
+        self.local_llm_box.setVisible(backend == "local")
+        # 服务地址/接口类型/单句超时在"高级设置"里，是另一棵子树，得单独显隐
+        self.local_advanced_box.setVisible(backend == "local")
+        if backend == "local":
+            # 切回本地时顺手问一次服务（模型可能是刚拉下来的）
+            self.refresh_local_models()
+
+    def on_local_model_changed(self, model):
+        """换了本地模型：缓存键里带着模型名，所以旧译文不会被误用"""
+        model = (model or "").strip()
+        if model:
+            config.set("local_llm_model", model)
+
+    def on_local_url_changed(self):
+        url = self.local_url_edit.text().strip()
+        if url != config.get("local_llm_url", ""):
+            config.set("local_llm_url", url)
+            self.refresh_local_models()
+
+    def on_local_api_changed(self, text):
+        config.set("local_llm_api", "openai" if text.startswith("OpenAI") else "ollama")
+        self.refresh_local_models()
+
+    def on_local_timeout_changed(self, value):
+        config.set("local_llm_timeout_ms", int(value))
+
+    def refresh_local_models(self):
+        """后台问一次本地服务有哪些模型，回来再填下拉框（不阻塞界面）"""
+        self._start_local_check(with_translation=False)
+
+    def on_test_local_llm(self):
+        """测试连接"：后台连一次本地服务并真翻一句（顺带把模型热进显存）"""
+        self._start_local_check(with_translation=True)
+
+    def _start_local_check(self, with_translation):
+        if self._local_check_running:
+            return
+        self._local_check_running = True
+        self._local_check_verbose = with_translation
+        if with_translation:
+            self.local_test_button.setEnabled(False)
+            self.local_status_label.setText("测试中…")
+            self.local_status_label.setStyleSheet("color: gray;")
+        elif not self.local_status_label.text():
+            self.local_status_label.setText("正在查询本地服务…")
+        threading.Thread(target=self._local_check_worker, args=(with_translation,),
+                         daemon=True).start()
+        self._local_check_timer.start()
+
+    def _local_check_worker(self, with_translation):
+        """工作线程：只碰 requests 和普通属性，**绝不碰控件**（Qt 控件只能在界面线程里动）"""
+        ok, message = False, ""
+        try:
+            if with_translation:
+                ok, message = self.subtitle_manager.local_health()
+            models = self.subtitle_manager.local_models()
+        except Exception as e:
+            models, message = [], "测试出错：%s" % e
+        self._local_check_result = (ok, message, models)
+
+    def _poll_local_check(self):
+        """界面线程这边取后台结果（控件只能在界面线程碰，所以走定时器轮询）"""
+        result = self._local_check_result
+        if result is None:
+            return
+        self._local_check_result = None
+        self._local_check_timer.stop()
+        self._local_check_running = False
+        self.local_test_button.setEnabled(True)
+        ok, message, models = result
+        if models:
+            self._apply_local_models(models)
+        if self._local_check_verbose:
+            self.local_status_label.setText(message)
+            self.local_status_label.setStyleSheet("color: %s;" % ("#1a7f37" if ok else "#c62828"))
+        elif models:
+            self.local_status_label.setText("已连上本地服务，可用模型 %d 个" % len(models))
+            self.local_status_label.setStyleSheet("color: #555555;")
+        else:
+            # 查询型任务没拿到模型列表：多半是服务没起来，说清楚，别让人以为列表本来就是空的
+            self.local_status_label.setText(message or "连不上本地服务")
+            self.local_status_label.setStyleSheet("color: #c62828;")
+
+    def _apply_local_models(self, models):
+        """把服务里报出来的模型名填进下拉框，尽量不动用户当前的选择"""
+        configured = str(config.get("local_llm_model", "") or "").strip()
+        current = self.local_model_combo.currentText().strip()
+        names = []
+        for name in list(models) + [configured, current]:
+            name = (name or "").strip()
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            return
+        pick = current if current in names else (configured if configured in names else names[0])
+        self.local_model_combo.blockSignals(True)
+        self.local_model_combo.clear()
+        self.local_model_combo.addItems(names)
+        self.local_model_combo.setCurrentText(pick)
+        self.local_model_combo.blockSignals(False)
+        if pick != configured:
+            config.set("local_llm_model", pick)
+
     def open_model_folder(self):
         # whisper模型默认缓存目录
         model_dir = os.path.expanduser("~/.cache/whisper")
@@ -1606,16 +2208,16 @@ class MainWindow(QMainWindow):
             return
             
         # 如果显示的是加载成功或失败信息，也不要立即覆盖
-        if ("已成功加载" in self.model_status_label.text() or 
+        if ("已成功加载" in self.model_status_label.text() or
             "加载失败" in self.model_status_label.text()):
             # 仅在combo box当前模型与显示不匹配时才更新
-            model_name = self.model_combo.currentText()
+            model_name = self._batch_model_name()
             if model_name not in self.model_status_label.text():
                 pass  # 继续更新
             else:
                 return  # 保持当前状态显示
-                
-        model_name = self.model_combo.currentText()
+
+        model_name = self._batch_model_name()
         model_dir = os.path.expanduser("~/.cache/whisper")
         found = False
         
@@ -1639,12 +2241,9 @@ class MainWindow(QMainWindow):
             current_model = self.audio_manager.current_model_name
             status_text += f" (当前使用: {current_model})"
             
-            # 同步更新下拉框选择的模型与当前使用的模型
+            # 同步更新下拉框选择的模型与当前使用的模型（流式后端下不动这个下拉）
             if current_model != model_name:
-                # 暂时阻断信号以避免触发 on_model_changed
-                self.model_combo.blockSignals(True)
-                self.model_combo.setCurrentText(current_model)
-                self.model_combo.blockSignals(False)
+                self._sync_asr_model_combo(current_model)
                 # 更新当前模型名称
                 model_name = current_model
         
@@ -1716,7 +2315,7 @@ class MainWindow(QMainWindow):
             print(f"正在加载配置的模型: {model_name}")
         
         # 禁用模型选择和按钮，避免用户重复操作
-        self.model_combo.setEnabled(False)
+        self.asr_model_combo.setEnabled(False)
         self.open_model_dir_button.setEnabled(False)
         
         # 使用状态标签显示加载状态
@@ -1752,7 +2351,7 @@ class MainWindow(QMainWindow):
         
         try:
             # 重新启用所有控件
-            self.model_combo.setEnabled(True)
+            self.asr_model_combo.setEnabled(True)
             self.open_model_dir_button.setEnabled(True)
             
             # 强制应用控件状态
@@ -1773,22 +2372,20 @@ class MainWindow(QMainWindow):
                 self.model_status_label.setText(f"当前模型: {current_model}")
                 self.model_status_label.setStyleSheet("color: green;") 
             
-            # 确保下拉框选择与当前模型一致
+            # 确保下拉框选择与当前模型一致（流式后端下这个下拉显示的是流式模型，不回填）
             if self.audio_manager.current_model_name:
-                self.model_combo.blockSignals(True)
-                self.model_combo.setCurrentText(self.audio_manager.current_model_name)
-                self.model_combo.blockSignals(False)
+                self._sync_asr_model_combo(self.audio_manager.current_model_name)
             
             # 再次强制更新UI
             QApplication.processEvents()
             
-            print(f"UI解锁完成，新状态: 按钮可用={self.model_combo.isEnabled()}, 状态文本='{self.model_status_label.text()}'")
+            print(f"UI解锁完成，新状态: 按钮可用={self.asr_model_combo.isEnabled()}, 状态文本='{self.model_status_label.text()}'")
         
         except Exception as e:
             print(f"强制解锁UI时出错: {str(e)}")
             # 最后的尝试 - 无条件启用所有控件
             try:
-                self.model_combo.setEnabled(True)
+                self.asr_model_combo.setEnabled(True)
                 self.open_model_dir_button.setEnabled(True)
                 self.model_status_label.setText("UI解锁失败，请重启应用")
                 self.model_status_label.setStyleSheet("color: red;")

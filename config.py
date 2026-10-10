@@ -25,6 +25,23 @@ class Config:
             "device": "cuda",  # 默认使用CUDA
             "source_language": "auto",  # 源语言，默认自动检测
             "target_language": "zh",  # 目标语言，默认中文
+            # 翻译后端：local = 本机大模型（translation/local_llm_translator.py 调 Ollama /
+            # llama-server），google = googletrans 的公网免费接口（实测单句 2.1~2.7 秒、会被限流、
+            # 断网即废）。默认走本地。
+            "translation_backend": "local",
+            "local_llm_url": "http://127.0.0.1:11434",  # 本地推理服务的地址
+            # 接口类型：ollama = Ollama 原生接口（能设 keep_alive、返回耗时明细）；
+            # openai = OpenAI 兼容接口（llama.cpp 的 llama-server 用这个）
+            "local_llm_api": "ollama",
+            "local_llm_model": "cas/eurollm-1.7b-instruct-q8:latest",
+            "local_llm_timeout_ms": 3000,   # 单句翻译超时，超了就按失败回落
+            # 模型在显存/内存里保留多久。闲置被卸掉后下一句要重新加载（冷加载实测 6.5 秒，
+            # 这也是第一次翻译特别慢的原因），所以默认留得久一点。
+            "local_llm_keep_alive": "30m",
+            "local_llm_num_predict": 256,   # 单句译文最多生成多少 token
+            "local_llm_num_ctx": 2048,      # 上下文窗口大小
+            "local_llm_temperature": 0.0,   # 翻译要的是稳定，默认贪心解码
+            "local_llm_fallback_to_google": False,  # 本地失败时是否自动改走谷歌
             "window_width": 800,  # 字幕窗口宽度
             "window_height": 200,   # 字幕窗口高度
             # 窗口高度是否跟着内容自动走：True 时高度 = 上/中/下三处间隙 + 各行，
@@ -38,8 +55,47 @@ class Config:
             # 原文字幕逐词显示：边说边识别，字幕跟着听到的语音一个词一个词冒出来。
             # 关闭则退回"整句识别完再一次性显示"。
             "word_by_word_enabled": True,
-            # 说话过程中每隔多少毫秒提交一次预览识别（逐词显示靠它）
+            # 译文字幕逐词显示：原文还在一段段往外确认的时候，先把半截句子送去翻译，
+            # 译文跟着原文一起长；关闭则只在整句定稿时翻一次（更稳、请求更少）。
+            # 流式识别后端用引擎的"已确认前缀"；整句后端用逐词通路已经念出来的半句
+            # （所以整句后端下还要勾着「原文逐词显示」才有东西可翻）。
+            # 旧键 `simul_simultaneous_translate`（只在流式后端下有效的"边说边翻译"）
+            # 由 `_migrate_settings` 迁到这里，见那里。
+            "translation_word_by_word": True,
+            # 说话过程中每隔多少毫秒提交一次预览识别（逐词显示靠它）。
+            # 只在整句识别后端下用；流式识别后端自己就是边说边出，不需要它。
             "partial_interval_ms": 1000,
+
+            # ── 流式识别（SimulStreaming，见 audio/simul_asr.py）──────────────
+            # whisper_batch = 今天的整句识别（安全默认）；simul = 边说边出已确认前缀。
+            # 改这一项要重新"开始翻译"才生效。
+            "asr_backend": "whisper_batch",
+            # 流式用的模型。复用 ~/.cache/whisper 下同名 .pt（没有才下载）。
+            # small 实测实时倍率 0.15~0.22（GTX 1070 Ti），medium 要实测显存。
+            "simul_model": "small",
+            # 攒够这么多毫秒的音频才提交一次解码（本机单次 150~270ms，间隔太小会
+            # 让 GPU 一直忙、间隔太大译文出得慢）
+            "simul_commit_interval_ms": 800,
+            # 注意力阈值（帧）：离音频末尾这么近的帧不解码，末尾未确认的词一律截断。
+            # 越大越稳但字延迟越大（实测最长字延迟 0.63s@12 vs 0.95s@25），
+            # 上游命令行默认 25，这里用 12。
+            "simul_frame_threshold": 12,
+            # 引擎最少要攒这么多毫秒的音频才肯解码（短于此的句子出不了词）
+            "simul_min_chunk_ms": 600,
+            # 上游的 never_fire：调试用，正常保持 False
+            "simul_never_fire": False,
+            # 给模型的历史上下文上限（token）；0 = 不限制
+            "simul_max_context_tokens": 0,
+            # 一句话最长多少秒就强制收尾（全程不停口时靠它把长句切成句）。
+            # 注意：每次提交都要把当前这段音频重新过一遍编码器，句子越长单次提交
+            # 越慢（真实语音实测：5 秒 245ms → 28 秒最慢 330ms，定稿 222ms），
+            # 25 秒很宽裕。**别用"同一批词重复摆"的合成音频去量**：重复内容会把
+            # 解码带进死循环，定稿一次 75 秒，数字全不可信（见 check_simul_stream.py）。
+            "simul_max_utterance_sec": 25,
+            # 前缀翻译的节流间隔（毫秒）：太密只会让翻译线程空转。
+            # "前缀"= 还没定稿的半截原文（流式的已确认前缀 / 整句后端的半截识别），
+            # 见 `translation_word_by_word`。
+            "simul_prefix_interval_ms": 800,
             "main_window_width": 800,  # 主窗口宽度
             "main_window_height": 600,   # 主窗口高度
             "show_audio_stats": True,  # 是否显示音频数据统计信息 - 修改为默认开启
@@ -95,15 +151,33 @@ class Config:
 
     def ensure_all_settings_exist(self):
         """确保所有默认设置项都存在于当前设置中"""
-        needs_save = False
+        needs_save = self._migrate_settings()
         for key, value in self.default_settings.items():
             if key not in self.settings:
                 self.settings[key] = value
                 needs_save = True
-        
+
         # 如果有缺失项，立即保存更新后的设置
         if needs_save:
             self.save_settings()
+
+    def _migrate_settings(self):
+        """旧键迁移：`simul_simultaneous_translate` → `translation_word_by_word`
+
+        原来那个"边说边翻译"只在流式识别后端下有效（整句后端根本取不到半截原文）；
+        现在译文逐词/逐句是个通用选项，两种后端都吃，键也跟着改名。
+
+        必须赶在 `ensure_all_settings_exist` 补默认值**之前**读旧键：补完默认值之后
+        新键就"已经存在"了，用户原来关掉的那个开关会被默认的 True 顶掉。
+
+        返回 True 表示动过设置（调用方要落盘）。
+        """
+        if ("translation_word_by_word" not in self.settings
+                and "simul_simultaneous_translate" in self.settings):
+            self.settings["translation_word_by_word"] = bool(
+                self.settings["simul_simultaneous_translate"])
+            return True
+        return False
 
     def get(self, key, default=None):
         """获取配置项，如果不存在则返回默认值"""

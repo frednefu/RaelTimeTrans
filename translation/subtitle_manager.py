@@ -1,6 +1,12 @@
 from googletrans import Translator
 import time
 import threading
+from collections import OrderedDict
+
+from config import config
+from translation.local_llm_translator import (LocalLLMTranslator,
+                                              normalize_placeholders,
+                                              strip_leftover_placeholders)
 from translation.term_manager import TermManager
 import re
 import uuid
@@ -9,7 +15,14 @@ import traceback
 class SubtitleManager:
     def __init__(self):
         self.translator = Translator()
-        self.translation_cache = {}  # 缓存已翻译的文本，减少API调用
+        # 整段翻译结果的 LRU 缓存：键是 (后端签名, 目标语言, 原文)，值就是最后要显示的文本。
+        # 业余无线电里 "Roger"、"QSL"、"five nine" 这类重复率极高，命中一次就省掉一整轮
+        # 术语处理 + 翻译 + 还原。后端签名参与键，所以换了引擎/模型自然就不会命中旧译文。
+        self.translation_cache = OrderedDict()
+        self.translation_cache_size = 256
+        # 本地翻译客户端，用时才建（translation_backend == "local" 才用得上）
+        self.local_translator = None
+        self.local_last_error = None
         self.lock = threading.Lock()  # 线程锁，防止多线程同时访问缓存
         
         # 初始化术语管理器
@@ -106,6 +119,16 @@ class SubtitleManager:
         # 记录开始时间
         start_time = time.time()
 
+        # 同一句话 + 同一个引擎/模型翻过就直接用（重复的短句在业余无线电里很常见）
+        cache_key = (self._backend_signature(), target_code, text)
+        cached = self.translation_cache.get(cache_key)
+        if cached is not None:
+            self.translation_cache.move_to_end(cache_key)
+            self.translation_delay = int((time.time() - start_time) * 1000)
+            if debug:
+                print(f"命中翻译缓存: {cached}")
+            return cached
+
         try:
             # 步骤1: 处理信号报告
             processed_text = self.term_manager.extract_and_convert_signal_report(text)
@@ -128,26 +151,35 @@ class SubtitleManager:
                 print(f"步骤4 - 术语预处理: {preprocessed_text}")
                 print(f"术语替换表: {replacements}")
             
-            # 步骤5: 翻译非术语部分
+            # 步骤5: 翻译非术语部分（传输层按 translation_backend 分派：本地模型 / 谷歌）
             try:
-                translated_text = self.translator.translate(preprocessed_text, dest=target_code).text
+                translated_text = self._transport_translate(preprocessed_text, target_code, debug)
                 if debug:
                     print(f"步骤5 - 基础翻译: {translated_text}")
             except Exception as e:
                 if debug:
-                    print(f"谷歌翻译API出错: {str(e)}")
+                    print(f"翻译环节出错: {str(e)}")
                 # 如果翻译失败，返回处理后的文本
                 return processed_text
-            
+
             # 步骤6: 还原术语占位符
             try:
+                # 本地模型偶尔会把占位符写花（多加空格、下划线个数不对），先规整回 __TERM_0__；
+                # 只有这一步的输入确实带占位符时才做，免得误伤正常译文里的 "term 3" 之类。
+                if replacements:
+                    translated_text = normalize_placeholders(translated_text)
                 final_text = self.term_manager.restore_ham_radio_terms(translated_text, replacements)
-                
+
                 # 检查是否还有未替换的占位符
                 if '__TERM_' in final_text or '__term_' in final_text:
                     # 如果还有未替换的占位符，尝试再次执行替换
                     final_text = self.term_manager.restore_ham_radio_terms(final_text, replacements)
-                
+
+                # 两轮还原之后还留着，说明模型把占位符写得太花、匹配不上了：把残骸抠掉。
+                # 字幕上绝不能出现 __TERM_0__ 这种机器码（代价是这个术语的译文丢了）。
+                if replacements and 'TERM' in final_text.upper():
+                    final_text = strip_leftover_placeholders(final_text)
+
                 if debug:
                     print(f"步骤6 - 术语还原: {final_text}")
             except Exception as e:
@@ -156,11 +188,13 @@ class SubtitleManager:
                     traceback.print_exc()
                 # 如果还原失败，返回翻译后的文本
                 final_text = translated_text
-            
+
             # 计算翻译延迟
             end_time = time.time()
             self.translation_delay = int((end_time - start_time) * 1000)
-            
+            # 只缓存走完整条管线的结果（上面任何一步失败都已经提前 return 了）
+            self._cache_put(cache_key, final_text)
+
             return final_text
             
         except Exception as e:
@@ -177,6 +211,63 @@ class SubtitleManager:
             except:
                 return text
     
+    def _backend_signature(self):
+        """缓存键的一部分：换了引擎/模型/地址，旧译文就不该再命中"""
+        backend = str(config.get("translation_backend", "local") or "local").lower()
+        if backend == "google":
+            return "google"
+        return "local|%s|%s" % (config.get("local_llm_url", ""), config.get("local_llm_model", ""))
+
+    def _cache_put(self, key, value):
+        """放进 LRU 缓存（调用前必须持有 self.lock）"""
+        self.translation_cache[key] = value
+        self.translation_cache.move_to_end(key)
+        while len(self.translation_cache) > self.translation_cache_size:
+            self.translation_cache.popitem(last=False)
+
+    def clear_cache(self):
+        """清空翻译缓存（不调也不会串味：缓存键里带着后端签名）"""
+        with self.lock:
+            self.translation_cache.clear()
+
+    def _get_local_translator(self):
+        if self.local_translator is None:
+            self.local_translator = LocalLLMTranslator()
+        return self.local_translator
+
+    def local_health(self):
+        """给界面的"测试连接"用：探活 + 真翻一句（顺带把模型加载进显存）"""
+        return self._get_local_translator().self_test()
+
+    def local_models(self):
+        """给界面的下拉框用：本地服务里都有哪些模型（连不上返回空列表）"""
+        return self._get_local_translator().list_models() or []
+
+    def _transport_translate(self, preprocessed_text, target_code, debug=False):
+        """第 5 步那一次真正的传输：按 translation_backend 分派到本地模型或谷歌
+
+        和原来一样，失败时**抛异常**，由调用处（步骤 5 的 except）决定回落 —— 那边会返回
+        已处理的文本，字幕不至于崩掉。
+        """
+        backend = str(config.get("translation_backend", "local") or "local").lower()
+        if backend == "google":
+            if debug:
+                print("翻译后端: Google（公网）")
+            return self.translator.translate(preprocessed_text, dest=target_code).text
+
+        translator = self._get_local_translator()
+        if debug:
+            print("翻译后端: 本地 %s" % config.get("local_llm_model", ""))
+        result = translator.translate(preprocessed_text, target_code)
+        self.local_last_error = translator.last_error
+        if result is not None:
+            return result
+        if config.get("local_llm_fallback_to_google", False):
+            if debug:
+                print("本地翻译失败（%s），按设置回落到谷歌" % translator.last_error)
+            return self.translator.translate(preprocessed_text, dest=target_code).text
+        raise RuntimeError("本地翻译失败：%s" % (translator.last_error or "未知原因"))
+
     def _restore_case(self, translated_text, original_patterns):
         """
         恢复译文中的英文单词大小写为原文中的大小写形式
