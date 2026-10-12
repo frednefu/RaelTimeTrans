@@ -8,6 +8,9 @@
    半截原文按识别后端二选一：流式取引擎的已确认前缀，整句取逐词通路已经念出来的
    那半句（所以整句后端下不勾「原文逐词显示」就没有来源，一个请求都不发）；
 2. 前缀译文**只上屏**——绝不进 `add_translated_text`（那就是 SRT 落盘的入口）；
+   上屏走 `update_text`，并且**带着句号**（`translation_key=utterance_id`、
+   `translation_final=False`）：字幕窗靠这俩决定这一刻是"同一句的最新半截、原地替换"
+   还是"新的一句、把旧的那句留在框顶那一行"；
 3. 整句定稿一到，这一句的前缀请求全部作废、后续也不再送（词表里的 `is_final`：
    回来得晚的半截译文不能把整句译文盖回一个更短的版本，也不能贴到下一句的原文上）；
 4. "不翻译"模式、源语言=目标语言、以及把「译文逐词显示」关掉，这几条短路照旧生效
@@ -128,11 +131,15 @@ class PrefixTranslationTest(unittest.TestCase):
         # 只改内存里的设置，绝不写 settings.json（config.set 会立刻落盘）
         self._saved = {k: config.settings.get(k) for k in
                        ("word_by_word_enabled", "translation_word_by_word",
-                        "asr_backend", "simul_prefix_interval_ms")}
+                        "asr_backend", "simul_prefix_interval_ms",
+                        "source_language")}
         config.settings["word_by_word_enabled"] = True
         config.settings["translation_word_by_word"] = True
         config.settings["asr_backend"] = "simul"
         config.settings["simul_prefix_interval_ms"] = 800
+        # 显式指定源语言（默认的 auto 一律不跳过翻译，见 `_is_same_language`），
+        # 免得这几个用例的结果跟着 settings.json 里的活值飘
+        config.settings["source_language"] = "en"
 
         mw = MainWindow.__new__(MainWindow)
         mw.audio_manager = FakeAudioManager()
@@ -215,7 +222,8 @@ class PrefixTranslationTest(unittest.TestCase):
         self.mw.update_subtitles()
 
         self.assertEqual(self.mw.subtitle_window.calls,
-                         [{"translation_text": "罗杰"}])
+                         [{"translation_text": "罗杰", "translation_key": 1,
+                           "translation_final": False}])
         self.assertEqual(self.mw.audio_manager.srt_rows, [])
 
     def test_final_invalidates_prefix_requests(self):
@@ -248,7 +256,10 @@ class PrefixTranslationTest(unittest.TestCase):
         self.assertEqual(self.mw.audio_manager.srt_rows,
                          [(self.mw.audio_manager.latest_text, "罗杰，完毕，字母……")])
         self.assertEqual(self.mw.subtitle_window.calls[-1],
-                         {"translation_text": "罗杰，完毕，字母……"})
+                         {"translation_text": "罗杰，完毕，字母……",
+                          # 流式后端没有词段、也就没有句号，整句那条路退回原文文本当 key
+                          "translation_key": self.mw.audio_manager.latest_text,
+                          "translation_final": True})
 
     def test_prefix_from_the_previous_sentence_is_dropped(self):
         """换句之后，上一句的前缀译文不能贴到这一句的原文下面"""
@@ -283,7 +294,8 @@ class PrefixTranslationTest(unittest.TestCase):
         self.mw.update_subtitles()
         self.assertEqual(self._prefix_requests(), [])
         self.assertEqual(self.mw.subtitle_window.calls,
-                         [{"translation_text": "Roger"}])
+                         [{"translation_text": "Roger", "translation_key": 1,
+                           "translation_final": False}])
 
     def test_option_off_means_no_prefix(self):
         """关掉「译文逐词显示」就退回"定稿后才翻"：一个前缀请求都不发"""

@@ -15,6 +15,7 @@ from translation.subtitle_file_manager import SubtitleFileManager
 import torch
 from audio.audio_processor import AudioProcessor
 from audio.audio_timeline import TimedWord, WordSegment, AudioSegmentTask
+from text_guards import clean_transcribed_text
 from config import config  # 添加 config 导入
 from model_residency import model_residency, free_cuda_cache
 
@@ -71,6 +72,12 @@ _StreamEvent = namedtuple('_StreamEvent', ['kind', 'utterance_id', 'offset_sec',
 # 语音起点前多喂几块（1 块 ≈ 64ms）。检测"语音开始"要连续两帧，起点其实在第一帧
 # 之前，不往回带一点的话第一个词会被切掉半个。
 _STREAM_PREROLL_CHUNKS = 8
+
+# 流式"停滞看门狗"：前缀连着这么多次提交（每次约 simul_commit_interval_ms，默认
+# 800ms）都没变长，就认为引擎卡住了——它每句话只检测一次语言，中英交替时后半段
+# 解不出来、反复吐同一个词（屏幕上就是"youtube youtube youtube…"一直长）。
+# 这时叫录音线程把这句话断掉，下一句重新检测语言。3 次 ≈ 2.4 秒。
+_STREAM_STALL_COMMITS = 3
 
 # 逐词字幕的时间轴：TimedWord / WordSegment / AudioSegmentTask 定义在
 # audio_timeline 里（时间一律用"采集块号"，1 块 ≈ 64ms），见该模块的说明。
@@ -254,6 +261,9 @@ class AudioManager:
         self._stream_round = 0
         # 上一轮线程没收干净（join 超时）时置 True → 下一轮不复用引擎，重建。
         self._stream_engine_dirty = False
+        # 流式线程请录音线程断句的握手标志（见 _consume_stream_stall_break）：
+        # 前缀连着几次没长就置上，录音线程在下一块音频处按"句尾"处理。
+        self._stream_stall_break = False
         # 交接中的旧引擎：线程已经退出、但还没卸，等新一轮的流式线程先卸它再热新模型
         # （保证显卡上任何时刻只有一份 whisper）。
         self._retired_stream_engine = None
@@ -300,6 +310,10 @@ class AudioManager:
         # 输出（播放）音量（用于界面音量表）
         self.output_volume = 0.0
         self._output_volume_time = 0.0
+        # 音频数据统计快照（界面「显示音频数据统计信息」那个勾选框，见
+        # `get_audio_stats`）：`_record_audio` 每采到一块就更新一次（输入监听那条
+        # 路不算，它不经过 `_record_audio`）。
+        self._audio_stats = self._empty_audio_stats()
         # 播放失败时的原因（None 表示正常），界面据此提示"为什么没声音"
         self.output_error = None
         # 播放线程的停止信号（与 is_running 分离，便于运行中单独开关监听）
@@ -902,6 +916,9 @@ class AudioManager:
             frame_count = 0
             start_performance_time = time.time()
             last_progress_time = time.time()
+
+            # 音频统计归零：这一轮从头开始攒（界面上的"已采集 N 秒"跟着走）
+            self.reset_audio_stats()
             
             # 语音分段参数
             max_record_seconds = 7.0  # 最长一段音频，超过就强制切（Whisper 的窗口是 30 秒）
@@ -1007,6 +1024,12 @@ class AudioManager:
 
                     speech_threshold = max(noise_floor * noise_ratio, min_noise_floor)
                     is_silent = current_volume <= speech_threshold
+
+                    # 音频数据统计：每块更新一次快照，界面（「显示音频数据统计信息」）
+                    # 按音量表那个节拍读 `get_audio_stats()`。放在这里是因为这一块该算的
+                    # 都在手上了（峰值在上一行、底噪与阈值刚更新）。
+                    self._update_audio_stats(audio_array, is_silent,
+                                             noise_floor, speech_threshold)
 
                     # 检测静音/语音
                     if not is_silent:  # 检测到声音
@@ -1136,20 +1159,30 @@ class AudioManager:
                         # simul_max_utterance_sec 兜着就行。
                         stalled_submit = False
 
+                    # 4. 停滞兜底：流式引擎报"前缀连着几次没长"（语言锁死/复读），
+                    #    按句尾处理，让下一句重新检测语言。见 _stream_recognize 里
+                    #    置标志那一段与 _consume_stream_stall_break。
+                    stall_break = self._consume_stream_stall_break()
+
                     # 每300帧打印一次分段状态
                     if speech_detected and frame_count % 300 == 0:
                         print(f"语音分段状态: 缓冲区={recognition_buffer_duration:.2f}秒, 连续静音={silence_frames}帧/{required_silence_frames}帧, 最大时长达到={max_duration_reached}, 句子结束={sentence_end_detected}, 兜底提交={stalled_submit}")
 
                     # 根据上述条件决定是否提交音频
-                    if max_duration_reached or sentence_end_detected or stalled_submit:
+                    if max_duration_reached or sentence_end_detected or stalled_submit or stall_break:
                         if self._stream_live():
                             # 流式：这段音频早就一块块喂给引擎了，这里只需告诉它
                             # "这句话说完了"，让它定稿。不作 RMS/语音帧数的丢弃判断——
                             # 有没有内容是引擎自己判的（没词就什么都不出），
                             # 而这条音频已经进过引擎了，丢掉判断反而更一致。
                             if speech_detected:
-                                print(f"流式识别：第{utterance_id}句结束"
-                                      f"（{recognition_buffer_duration:.2f}秒），提交定稿")
+                                if stall_break:
+                                    print(f"流式识别：第{utterance_id}句被停滞看门狗"
+                                          f"切断（{recognition_buffer_duration:.2f}秒），"
+                                          f"下一句重新检测语种")
+                                else:
+                                    print(f"流式识别：第{utterance_id}句结束"
+                                          f"（{recognition_buffer_duration:.2f}秒），提交定稿")
                                 self._stream_end(stream_q, utterance_id)
                             else:
                                 # 一句话说完之后一直没人说话，缓冲区单靠静音攒到了
@@ -1430,9 +1463,20 @@ class AudioManager:
 
         翻译模型不在这里放：它一个就 1.7 GB，和 whisper small 同驻完全撑得住，
         放掉反而让下一句要等冷加载（第一次翻译特别慢的老毛病）。
+
+        `release_others` 只挑账本上 `resident=True` 的项，所以**账本准不准直接决定这里
+        放不放得掉**：整句模型现在在"加载完成"那一刻就 `touch`（见
+        `audio/audio_processor._get_model_locked`），不会再出现"占着显存但账上写着没占"
+        因而谁都回收不了的情况。
         """
         keep = {"llm"}
         keep.add("asr_simul" if self.asr_backend == "simul" else "asr_batch")
+        # 上一轮的流式线程还没退干净时，它手上的引擎**正在被用**：`force=True` 会绕过
+        # guard（guard 是"不在识别时才许卸"），把这个模型从它脚底下抽走。这种情况
+        # 让它自己在 finally 里卸（见 `_stream_recognize`），这里只放 keep 之外的。
+        thread = self.stream_thread
+        if thread is not None and thread.is_alive():
+            keep.add("asr_simul")
         freed = model_residency.release_others(keep=keep, force=True)
         if freed:
             print(f"显存回收：为本次识别腾地方，释放了 {freed} 个用不到的模型")
@@ -1506,6 +1550,17 @@ class AudioManager:
         self.stream_error = None
 
         # 1. 收掉上一轮
+        #
+        # **轮次号先自增，再 join**。旧线程的中途检查和 finally 都拿自己捕获的
+        # round_id 和 `self._stream_round` 比，早一步自增就能让它必定看到"我已经不是
+        # 当前这一轮了"，于是不论从哪个分支退出都会自己 `unload()` 引擎。
+        # 放在 join 之后有个真实的竞态：join 超时判成 `exited=False` → 不交接旧引擎
+        # → 紧接着 `self.stream_engine` 被新引擎覆盖，而旧线程恰好在这两步之间退出，
+        # 它退出时 `current()` 还是真 → 不卸。那个引擎对象连同它 1.4 GB 的显存从此
+        # 谁都不再引用，`empty_cache()` 也从没跑过，nvidia-smi 就一直高着——
+        # 冷启（加载慢、join 必超时）时"停 → 立刻再开"最容易撞上，这就是"显存不是
+        # 每次都被撑满"里最难复现的那一条。
+        self._stream_round += 1
         self._signal_stream_stop()
         thread = self.stream_thread
         exited = True
@@ -1516,7 +1571,8 @@ class AudioManager:
                 # 还没退（多半是 warmup 卡在加载里）。不让它拖住新一轮：
                 # 标记脏，本轮不复用这个引擎，重建一个干净的。
                 self._stream_engine_dirty = True
-                print("上一轮流式识别线程未在 3 秒内退出，本轮将重建引擎")
+                print("上一轮流式识别线程未在 3 秒内退出，本轮将重建引擎；"
+                      "它手上的引擎会在它退出时自己卸掉（轮次号已经自增）")
 
         if self.asr_backend != "simul":
             # 引擎保活：这里**不**卸载。整句后端下它只是闲置，由协调器的闲置回收
@@ -1528,7 +1584,13 @@ class AudioManager:
             return
 
         # 2. 复用还是重建
+        #
+        # `ready` 也是复用条件之一：旧线程如果在 join 期间才退出，它的 finally 会看到
+        # "我已经不是当前这一轮了"，于是把引擎卸掉（那是设计内的——见第 1 步的说明）。
+        # 这时 `self.stream_engine` 还指着那个**已经被卸空**的对象，光比签名会误判成
+        # 复用，日志写着"复用"、实际却在 warmup 里默默重加载（账本也跟着错）。
         reused = (self.stream_engine is not None
+                  and self.stream_engine.ready
                   and not self._stream_engine_dirty
                   and self._stream_state != "failed"
                   and self.stream_engine.signature == self._stream_signature())
@@ -1551,11 +1613,11 @@ class AudioManager:
                 self._retired_stream_engine = retired
             self.stream_engine = self._new_stream_engine()
 
-        # 3. 新一轮的队列/信号/轮次
+        # 3. 新一轮的队列/信号（轮次号在第 1 步就自增过了，见那里的说明）
         self._stream_engine_dirty = False
+        self._stream_stall_break = False
         self.stream_queue = queue.Queue()
         self._stream_stop_event = threading.Event()
-        self._stream_round += 1
         self._stream_state = "starting"
         self.stream_thread = threading.Thread(
             target=self._stream_recognize,
@@ -1619,7 +1681,40 @@ class AudioManager:
         except Exception as e:
             print(f"流式识别收尾失败: {str(e)}")
 
+    # ── 流式停滞兜底：流式线程与录音线程的握手 ──────────────────────────
+
+    def _consume_stream_stall_break(self):
+        """取一次"流式卡住了，请断句"的请求（取走即清），取到返回 True
+
+        断句必须由**录音线程**做：`begin` 事件是它按 VAD 语音起点发出来的，流式线程
+        自己"重开一句"没有对应的起点。所以这边置标志、那边在下一块音频处按"句尾"
+        处理——效果等价于用户在这里停顿了一下，而下一句会让引擎重新检测语言
+        （上游 `refresh_segment` 把 `detected_language` 清回 None）。
+        """
+        if not self._stream_stall_break:
+            return False
+        self._stream_stall_break = False
+        return self._stream_live()
+
     # ── 显存回收：登记给 model_residency 的两个回调 ──────────────────────
+
+    def _retire_failed_engine(self, engine):
+        """引擎废了：立刻把它从显存放下来（失败分支专用）
+
+        失败之后录音线程下一块音频就改走整句识别（`_stream_live()` 变 False），而整句
+        通路会把**另一份** whisper 加载进来。这里不卸的话，本轮就同时驻留两份 whisper
+        （各约 1.4 GB）直到下一次点「开始」——8 GB 卡上这就是"显存被撑爆"的那一下。
+        原来只置 `_stream_state="failed"` 就 return，`finally` 又因为仍是当前轮而不卸，
+        正是这个漏。`unload()` 幂等，`_stream_recognize` 的 finally 再调一次无害。
+        """
+        if self.stream_engine is engine:
+            self.stream_engine = None
+            self._retired_stream_engine = None
+        try:
+            engine.unload()
+        except Exception as e:
+            print(f"卸载失败的流式引擎时出错（忽略）：{e}")
+        model_residency.mark_released("asr_simul")
 
     def _release_stream_engine(self):
         """把流式引擎和它的显存放掉（协调器的 release_fn）
@@ -1687,6 +1782,7 @@ class AudioManager:
             if not warmed:
                 self.stream_error = engine.last_error or "引擎创建失败"
                 self._stream_state = "failed"
+                self._retire_failed_engine(engine)
                 print(f"流式识别起不来，本次运行自动退回整句识别：{self.stream_error}")
                 return
 
@@ -1699,6 +1795,8 @@ class AudioManager:
             started = False            # 当前这句话引擎已经在跟了吗
             utterance = None           # 当前这句话的编号
             failures = 0               # 连续失败次数（连着三次说明引擎废了）
+            last_prefix_text = None    # 上一次提交的前缀文本（判"有没有长"）
+            stall_commits = 0          # 连续几次提交前缀都没变长
 
             while not stop_event.is_set():
                 try:
@@ -1744,17 +1842,42 @@ class AudioManager:
                         result = engine.commit()
                         if result:
                             failures = 0
+                            # 停滞看门狗：前缀没变长就记一笔（重复的段已经被
+                            # `_absorb` 拦下，所以"卡住"在这里表现为文本原地不动）。
+                            # 连着几次不动 → 请录音线程断句，下一句重新检测语言。
+                            if result.text == last_prefix_text:
+                                stall_commits += 1
+                            else:
+                                stall_commits = 0
+                            last_prefix_text = result.text
                             self._publish_stream_segment(engine, utterance, result,
                                                          is_final=False)
-                        elif engine.last_error:
-                            failures += 1
-                            if failures >= 3:
-                                raise RuntimeError(engine.last_error)
+                            if stall_commits >= _STREAM_STALL_COMMITS:
+                                stall_commits = 0
+                                self._stream_stall_break = True
+                                print(f"流式识别：第{utterance}句前缀连续 "
+                                      f"{_STREAM_STALL_COMMITS} 次没有变化"
+                                      f"（语种锁死或复读），请录音线程断句重新检测")
+                        else:
+                            # 一个字都没解出来：引擎在跟、也没报错，但同样算"没进展"
+                            if last_prefix_text is not None and not engine.last_error:
+                                stall_commits += 1
+                                if stall_commits >= _STREAM_STALL_COMMITS:
+                                    stall_commits = 0
+                                    self._stream_stall_break = True
+                                    print(f"流式识别：第{utterance}句连着 "
+                                          f"{_STREAM_STALL_COMMITS} 次没解出内容，"
+                                          f"请录音线程断句重新检测")
+                            if engine.last_error:
+                                failures += 1
+                                if failures >= 3:
+                                    raise RuntimeError(engine.last_error)
                 except Exception as e:
                     self.stream_error = f"流式识别出错：{e}"
                     if current():
                         self._stream_state = "failed"
                         self._clear_committed_prefix()
+                        self._retire_failed_engine(engine)
                     print(f"{self.stream_error}（本次运行退回整句识别）")
                     import traceback
                     traceback.print_exc()
@@ -1826,6 +1949,16 @@ class AudioManager:
         text = (result.text or "").strip()
         if not text:
             return
+
+        # 终稿也过一遍"这段不是人话"的判据（幻觉短语、复读乱码、纯标点）。
+        # 整句识别那条路一直有这道闸门，流式这边原来一个都没接，于是
+        # `[MUSIC PLAYING] [MUSIC PLAYING]`、"In +1. The I come 7 -1 -1-0- S"
+        # 这类对着噪声编出来的东西直接进了字幕和 SRT。
+        cleaned = clean_transcribed_text(text)
+        if not cleaned:
+            print(f"[流式终稿] 第{utterance_id}句整条判定为幻觉/噪音，丢弃：{text!r}")
+            return
+        text = cleaned
 
         # 识别延迟显示成"最后一次提交花的时间"：流式没有"整句耗时"这个东西，
         # 界面那行 [延迟: Nms] 显示单次提交的解码开销，正好反映机器跟不跟得上。
@@ -2157,6 +2290,69 @@ class AudioManager:
         if time.time() - self._output_volume_time > 0.5:
             return 0.0
         return self.output_volume
+
+    # ── 音频数据统计（界面「显示音频数据统计信息」）─────────────────────
+    # 这个选项以前是个哑的：配置键 `show_audio_stats` 只有**同步版** `process_audio`
+    # 读它（`audio/audio_processor.py`，那段代码已经不跑了），真正在跑的异步通路一次
+    # 都没读过，界面上更是从来没有显示的地方。现在采集侧每块更新一次快照，界面按音量表
+    # 那个节拍读出来显示（见 `MainWindow.update_audio_stats_label`）。
+
+    def _empty_audio_stats(self):
+        """一帧音频统计（本块 + 本轮累计），全部是"给人看的"量（0.0~1.0 / 秒）"""
+        return {
+            "sample_rate": int(self.sample_rate),
+            "chunk_samples": 0,
+            "chunk_ms": 0.0,
+            "peak": 0.0,            # 本块峰值（0.0~1.0）
+            "rms": 0.0,             # 本块 RMS（0.0~1.0）
+            "chunks": 0,            # 本轮已采集块数
+            "captured_sec": 0.0,    # 本轮已采集时长
+            "voiced_sec": 0.0,      # 本轮判为"有语音"（高于 VAD 阈值）的时长
+            "noise_floor": 0.0,     # 当前底噪估计（int16 量纲）
+            "speech_threshold": 0.0,  # 当前 VAD 判定阈值（int16 量纲）
+            "updated_at": 0.0,
+        }
+
+    def reset_audio_stats(self):
+        """统计归零（每轮录音开始时）"""
+        self._audio_stats = self._empty_audio_stats()
+
+    def _update_audio_stats(self, audio_array, is_silent, noise_floor, speech_threshold):
+        """更新统计快照：本块的峰值/RMS + 本轮累计时长（每采一块调一次）
+
+        `audio_array` 是 int16 的原始采样（和音量表同一个来源）。峰值/RMS 归一化到
+        0.0~1.0，界面直接乘 100 当百分比显示。
+        """
+        stats = self._audio_stats
+        samples = int(audio_array.size)
+        stats["chunk_samples"] = samples
+        stats["chunk_ms"] = samples * 1000.0 / max(1, self.sample_rate)
+        if samples:
+            normalized = audio_array.astype(np.float32) / 32768.0
+            stats["peak"] = float(np.max(np.abs(normalized)))
+            stats["rms"] = float(np.sqrt(np.mean(np.square(normalized))))
+        stats["chunks"] += 1
+        chunk_sec = samples / float(max(1, self.sample_rate))
+        stats["captured_sec"] += chunk_sec
+        if not is_silent:
+            stats["voiced_sec"] += chunk_sec
+        stats["noise_floor"] = float(noise_floor)
+        stats["speech_threshold"] = float(speech_threshold)
+        stats["updated_at"] = time.time()
+
+    def get_audio_stats(self):
+        """最近一块音频的统计快照（界面「显示音频数据统计信息」用）
+
+        超过 0.5 秒没有新数据（录音已停）就把"瞬时"那两项归零，和音量表一个道理：
+        不然界面上会一直挂着一个不动的数字，看着像还在采。
+        """
+        stats = dict(self._audio_stats)
+        if time.time() - stats.get("updated_at", 0.0) > 0.5:
+            stats["peak"] = 0.0
+            stats["rms"] = 0.0
+            stats["chunk_samples"] = 0
+            stats["chunk_ms"] = 0.0
+        return stats
 
     def _update_input_volume(self, peak):
         """更新输入音量：快速上升、缓慢下降，呈现平滑的 VU 表效果"""

@@ -18,9 +18,14 @@
 - 第一句换第二句时不滚（那时框里只有一行，滚了会空一下），第二句起才滚；
 - 滚动过程中不超过两行、位置只往上走，滚完停在同一位置（接缝不跳）；
 - 目标语言选"不翻译"时也是两行；
-- 译文行按同一套几何（左对齐 + 视口）：折的比两行少就按实际行数给盒（一行译文一个行距
-  高），超过两行就**不再撑高窗口**、内容整体上滚，屏幕上留的永远是最后两行（偏移 =
-  (行数 − 2) × 行距）；滚动是滑上去的（不是瞬移）；切走模式或清空译文后偏移归零。
+- 译文行按同一套几何（左对齐 + 视口）：折的比框高少就按实际行数给盒（一行译文一个
+  行距高），超过 `TRANSLATION_ROWS` 行就**不再撑高窗口**、内容整体上滚，屏幕上留的
+  永远是最后 `TRANSLATION_ROWS` 行（偏移 = (行数 − TRANSLATION_ROWS) × 行距）；
+  滚动是滑上去的（不是瞬移）；切走模式或清空译文后偏移归零；
+- 译文行也有"上一句"：新的一句译文到了，上一句留在框顶那一行（超长截断成一行），
+  不是整行清掉重画（用户报的"译文很长还没看完就被下一句顶掉"）；**同一句**的半截译文
+  → 整句译文（共用一把 key）是原地替换，不许把半截顶成上一句；`clear_translation`
+  和切模式要把上一句一起清掉。
 
 只读 settings.json，绝不写：要改的配置项直接写 `config.settings`（内存里），不走
 `config.set`。（唯一的写是 `config` 导入时补齐缺失的默认项。）
@@ -354,11 +359,15 @@ def main():
     wrapped_sentence = "THIS IS A WHOLE SENTENCE THAT IS LONG ENOUGH TO WRAP INTO " \
                        "TWO LINES FOR SURE, AND MAYBE EVEN LONGER THAN THAT"
     while True:
-        window.update_text(original_text=wrapped_sentence, translation_text="")
+        window.update_text(original_text=wrapped_sentence)
         lines_wrapped = window._label_text_lines(window.original_label)
         if lines_wrapped >= 2 or len(wrapped_sentence) > 4000:
             break
         wrapped_sentence += " AND IT KEEPS GOING ON AND ON"
+    # 上一节那句译文先撤掉：这一节量的是**原文行**，译文行留着会一起扫进文字行里。
+    # 注意不能用 `translation_text=""` 撤（那现在等于什么都不做，见 `update_text`），
+    # 译文行的上一句是字幕窗自己攒的，清空只有 `clear_translation` 这一个出口。
+    window.clear_translation()
     QTest.qWait(50)
     wrapped_bands = ink_bands(window)
     print(f"整句原文折行: {lines_wrapped} 行，行盒 "
@@ -429,13 +438,14 @@ def main():
                   f"译文行和原文行的左边界对齐（译文 {ink_left(window, wrapped[-1])}px vs "
                   f"原文 {ink_left(window, wrapped[1])}px）")
 
-    # 8c) 译文超过两行：框还是两行高，内容整体上滚，屏幕上留的是最后两行
+    # 8c) 译文超过框高（TRANSLATION_ROWS 行）：框不再长高，内容整体上滚，
+    #     屏幕上留的是最后 TRANSLATION_ROWS 行
     scrolled_text = long_translation + ("再多说几句，让这句译文长出第三行来，"
                                         "看看超出的部分是不是往上滚出去了。")
     while True:
         window.update_text(translation_text=scrolled_text)
         lines_n = window._label_text_lines(window.translation_label)
-        if lines_n >= 3:
+        if lines_n > TRANSLATION_ROWS:     # 要**超过**框高才有得滚
             break
         if len(scrolled_text) > 4000:      # 字体环境差太多时别把脚本挂在这儿
             break
@@ -444,12 +454,14 @@ def main():
     scrolled = ink_bands(window)
     translation_view_top = window.translation_view.mapTo(window, QPoint(0, 0)).y()
     translation_view_bottom = translation_view_top + window.translation_view.height()
-    print(f"译文超两行: {lines_n} 行，行盒 {window.translation_view.minimumHeight()}px，"
+    print(f"译文超框高: {lines_n} 行，行盒 {window.translation_view.minimumHeight()}px，"
           f"内容 {window.translation_view._content_height}px，偏移 {window.translation_view._offset}px"
           f"，文字行 {scrolled}（框 {translation_view_top}~{translation_view_bottom}）")
-    checker.check(lines_n >= 3, f"这一句译文至少三行（实测 {lines_n} 行）")
+    checker.check(lines_n > TRANSLATION_ROWS,
+                  f"这一句译文折行数超过框高 {TRANSLATION_ROWS}（实测 {lines_n} 行）")
     checker.check(window.translation_view.minimumHeight() == TRANSLATION_ROWS * translation_pitch,
-                  f"超两行时行盒仍是两行高（{window.translation_view.minimumHeight()}px，"
+                  f"超过框高之后行盒封顶在 {TRANSLATION_ROWS} 行"
+                  f"（{window.translation_view.minimumHeight()}px，"
                   f"期望 {TRANSLATION_ROWS * translation_pitch}px）")
     checker.check(window.translation_view._content_height == lines_n * translation_pitch,
                   f"内容高度按实际行数（{window.translation_view._content_height}px，"
@@ -458,20 +470,23 @@ def main():
                   f"滚了 {lines_n - TRANSLATION_ROWS} 个行距（偏移 "
                   f"{window.translation_view._offset}px，期望 "
                   f"{(lines_n - TRANSLATION_ROWS) * translation_pitch}px）")
-    checker.check(abs(window._required_height() - required_2line) <= 1,
-                  f"多出来的行不撑高窗口（需要 {window._required_height()}px，"
-                  f"两行时是 {required_2line}px）")
+    # 窗口只在"行数没满框"的那几级台阶上长高（本例是 2 行 → 3 行一个行距）；
+    # 再多的行一律靠滚动，窗口一动不动
+    checker.check(abs(window._required_height() - required_2line - translation_pitch) <= 1,
+                  f"封顶之后多出来的行不撑高窗口（需要 {window._required_height()}px，"
+                  f"两行时是 {required_2line}px、{TRANSLATION_ROWS} 行时该是 "
+                  f"{required_2line + translation_pitch}px）")
     checker.check(len(scrolled) == 2 + TRANSLATION_ROWS,
-                  f"屏幕上只剩原文两行 + 译文两行（实测 {len(scrolled)} 行文字）")
+                  f"屏幕上只剩原文两行 + 译文 {TRANSLATION_ROWS} 行（实测 {len(scrolled)} 行文字）")
     tail_tops = tops(scrolled[2:]) if len(scrolled) > 2 else [-1]
     checker.check(abs(tail_tops[0] - translation_view_top) <= TOL,
-                  f"露出来的是最后两行：第一行正好贴住译文框顶（{tail_tops[0]} vs "
+                  f"露出来的是最后 {TRANSLATION_ROWS} 行：第一行正好贴住译文框顶（{tail_tops[0]} vs "
                   f"框顶 {translation_view_top}）")
     checker.check(scrolled and scrolled[-1][1] <= translation_view_bottom + TOL,
                   f"最后一行整行都在框里（底 {scrolled[-1][1] if scrolled else '-'} ≤ "
                   f"框底 {translation_view_bottom}）")
 
-    # 8d) 流式那样一行一行长出来：1 行给 1 行盒，2 行给 2 行盒，再多才滚
+    # 8d) 流式那样一行一行长出来：没满框时按实际行数给盒，涨满框高之后才开始滚
     window.clear_translation()
     QTest.qWait(50)
     checker.check(window.translation_view.minimumHeight() == translation_pitch
@@ -512,12 +527,79 @@ def main():
     window.set_subtitle_mode("both")
     window.update_text(translation_text=scrolled_text)
     QTest.qWait(100 + MAX_TRANSLATION_SCROLL_MS)
-    checker.check(window.translation_view._offset > 0, "切回两行模式后滚动位置又对上了")
+    checker.check(window.translation_view._offset > 0, "切回「两者」后滚动位置又对上了")
     window.clear_translation()
     QTest.qWait(30)
     checker.check(window.translation_view._offset == 0, "清空译文后偏移归零")
     window.set_original_words("foxtrot golf", S1, 22)  # 把译文行清掉，回到纯原文
     QTest.qWait(50)
+
+    # 8f) 译文行的"上一句"（用户报的"译文很长还没看完就被下一句清掉"）：
+    #     新的一句译文到了，**上一句留在框顶那一行**（超长截断成一行），
+    #     而不是整行清掉重画。同一句的"半截译文 → 整句译文"共用一把 key，
+    #     那是**原地替换**，不许把半截顶成上一句。
+    window.clear_translation()
+    window.set_original_words("alpha", "", 31)
+    QTest.qWait(50)
+    checker.check(window._translation_prev == "" and window._translation_current == "",
+                  "clear_translation 连「上一句」那套状态一起清")
+    window.update_text(translation_text="第一句译文", translation_key=7,
+                       translation_final=True)
+    QTest.qWait(50)
+    checker.check(window.translation_label.text() == "第一句译文",
+                  f"第一句译文只有它自己（实测 {window.translation_label.text()!r}）")
+    window.update_text(translation_text="第二句译文", translation_key=8,
+                       translation_final=True)
+    QTest.qWait(50)
+    two_lines = window.translation_label.text()
+    print(f"换句后的译文行: {two_lines!r}")
+    checker.check(two_lines == "第一句译文\n第二句译文",
+                  f"新的一句到了，上一句还留在框顶（实测 {two_lines!r}）")
+    checker.check(window.translation_view._content_height == 2 * translation_pitch
+                  and window.translation_view.minimumHeight() == 2 * translation_pitch,
+                  f"上一句一行 + 当前句一行 → 框两行高、不滚"
+                  f"（盒 {window.translation_view.minimumHeight()}px、"
+                  f"内容 {window.translation_view._content_height}px）")
+
+    # 上一句超长：截断成一行（像原文行那样），不许把当前句挤出可见范围
+    window.update_text(translation_text=long_translation, translation_key=9,
+                       translation_final=True)
+    QTest.qWait(50)
+    window.update_text(translation_text="下一句", translation_key=10,
+                       translation_final=True)
+    QTest.qWait(50)
+    elided = window.translation_label.text()
+    print(f"上一句超长时: {elided!r}")
+    checker.check(elided.count("\n") == 1 and elided.endswith("\n下一句"),
+                  f"上一句被截断成一行（实测 {elided!r}）")
+    checker.check("…" in elided or "..." in elided,
+                  f"超长的那一截带省略号（实测 {elided!r}）")
+    checker.check(window._label_text_lines(window.translation_label) == 2,
+                  f"组合起来正好两行（实测 "
+                  f"{window._label_text_lines(window.translation_label)} 行）")
+
+    # 同一句：半截译文 → 整句译文（共用 key）是**原地替换**，不是翻页
+    window.clear_translation()
+    window.update_text(translation_text="半截译", translation_key=11,
+                       translation_final=False)
+    window.update_text(translation_text="整句译文", translation_key=11,
+                       translation_final=True)
+    QTest.qWait(30)
+    checker.check(window.translation_label.text() == "整句译文"
+                  and window._translation_prev == "",
+                  f"同一句的终稿把半截就地换掉、没顶成上一句（实测 "
+                  f"{window.translation_label.text()!r}）")
+
+    # 切模式要把"上一句"一起清掉（"不翻译"/"仅显示原文"时它不该留在框里）
+    window.update_text(translation_text="又一句", translation_key=12,
+                       translation_final=True)
+    window.set_subtitle_mode("original")
+    QTest.qWait(30)
+    checker.check(window._translation_prev == "" and window._translation_current == ""
+                  and window.translation_label.text() == "",
+                  "切到「仅显示原文」：上一句译文也不留")
+    window.set_subtitle_mode("both")
+    QTest.qWait(30)
 
     # 9) 字号变大 → 间隙一起变大（自适应），窗口高度还是"三处 + 各行"
     small_gap = window._row_gap()

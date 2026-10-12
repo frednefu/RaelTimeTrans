@@ -40,42 +40,10 @@ HAM_RADIO_PROMPT = (
 
 _prompt_cache = None
 
-# Whisper 对静音和噪声的典型幻觉输出。这些词一旦混进字幕，看起来就是"识别不
-# 准确"，实际上模型在那段音频里根本没听到人说话。
-_HALLUCINATION_PHRASES = [
-    "thank you", "thanks", "thank you for watching", "thanks for watching",
-    "please subscribe", "subscribe", "like and subscribe",
-    "谢谢观看", "谢谢收看", "感谢观看", "感谢收看",
-    "请订阅", "请点赞", "请评论", "字幕由", "字幕志愿者",
-]
-
-# 整条结果正好等于这些词时判定为幻觉（识别到纯静音时 Whisper 常吐这几个词）。
-# 用整条相等而不是包含来判断，避免误杀 "roger"、"over" 这类真实通联用语。
-_WHOLE_RESULT_HALLUCINATIONS = {
-    "you", "thank you", "thanks", "thank you.", "bye", "bye.", "okay", "okay.",
-    "please", "please.", "yeah", "yeah.", "so", "so.", "oh", "oh.",
-    "thank you very much", "thank you very much.", "you're welcome",
-    "♪", ".", ",", "...", "!", "?",
-}
-
-
-def _is_repetition_loop(text):
-    """判断识别结果是不是重复循环的乱码
-
-    噪声段会让 Whisper 陷入复读，输出 "ʰʰʰʰʰʰ…"、"විවිවිවි…" 这种整条几乎只有
-    一两个字符的内容。正常语句不可能长这样（字符种类必然很丰富）。
-    """
-    if len(text) < 8:
-        return False
-    if len(set(text)) <= 4:
-        return True
-    # 单个字符连续重复太多次
-    run = 1
-    for prev, cur in zip(text, text[1:]):
-        run = run + 1 if cur == prev else 1
-        if run >= 8:
-            return True
-    return False
+# "这段不是人话"的判据（幻觉短语、复读乱码、纯标点）在 `audio/text_guards.py`：
+# 流式识别（`audio/simul_asr.py`）也要用同一份——原来只有整句这条路接了闸门，
+# 流式那边 `youtube youtube youtube`、`[MUSIC PLAYING]` 能一路进字幕和 SRT。
+from text_guards import clean_transcribed_text  # noqa: E402
 
 
 # 判定"这段没有语音"的两个阈值：no_speech_prob 高**且**平均对数概率低才算没语音。
@@ -123,39 +91,6 @@ def transcribe_options(source_language, device="cpu"):
         # 抛异常把整次识别毁掉；顺手也省掉每秒刷屏的进度条。
         verbose=None,
     )
-
-
-def clean_transcribed_text(text):
-    """清掉识别结果里的幻觉短语、复读乱码和纯标点"""
-    if not text:
-        return ""
-
-    cleaned = " ".join(text.split())
-
-    # 整条就是常见的静音幻觉词
-    if cleaned.lower().strip(" .,!?") in {w.strip(" .,!?") for w in
-                                          _WHOLE_RESULT_HALLUCINATIONS}:
-        return ""
-
-    lowered = cleaned.lower()
-    # 先长后短：否则 "thank you" 会先把 "thank you for watching" 咬掉一半，
-    # 剩下 "for watching"
-    for phrase in sorted(_HALLUCINATION_PHRASES, key=len, reverse=True):
-        if phrase in lowered:
-            # 用大小写不敏感的方式整段去掉
-            idx = lowered.find(phrase)
-            while idx != -1:
-                cleaned = cleaned[:idx] + cleaned[idx + len(phrase):]
-                lowered = cleaned.lower()
-                idx = lowered.find(phrase)
-            cleaned = " ".join(cleaned.split())
-
-    if _is_repetition_loop(cleaned):
-        return ""
-
-    if not any(ch.isalnum() for ch in cleaned):
-        return ""
-    return cleaned.strip()
 
 
 def build_initial_prompt():
@@ -623,6 +558,22 @@ class AudioProcessor:
         with self._model_lock:
             return self._get_model_locked()
 
+    def _mark_model_resident(self):
+        """告诉显存协调器"整句模型已经加载进显存了"
+
+        之前只有**识别出文本**才 `touch`（`AudioManager.on_recognition_complete`），
+        于是"加载了模型但没产出文本"的路径（预览识别、静音段、识别异常）里，模型
+        **占着显存而账本上写着没占**——`release_others` / `release_all` / `sweep`
+        一律跳过它，连「释放显存」按钮都放不掉，这就是"显存被撑满"里最隐蔽的一条。
+
+        `model_residency` 模块级不 import torch，在这里 import 是安全的。
+        """
+        try:
+            from model_residency import model_residency
+            model_residency.touch("asr_batch")
+        except Exception as e:
+            print(f"登记整句识别模型失败（忽略）：{e}")
+
     def _get_model_locked(self):
         """`get_model()` 的实体（调用者必须已持有 `_model_lock`）"""
         try:
@@ -666,12 +617,13 @@ class AudioProcessor:
                         torch.cuda.empty_cache()
                 
                 print(f"加载Whisper模型: {model_name} 到 {self.device}")
-                
+
                 try:
                     # 尝试加载模型
                     self.model = whisper.load_model(model_name, device=self.device)
                     self.current_model_name = model_name
                     print(f"模型 {model_name} 加载完成")
+                    self._mark_model_resident()
                 except Exception as load_error:
                     # 如果是large模型加载失败，尝试降级到medium
                     if is_large_model:
@@ -682,6 +634,7 @@ class AudioProcessor:
                             print(f"降级到medium模型加载完成")
                             # 更新配置
                             config.set("whisper_model", "medium")
+                            self._mark_model_resident()
                         except Exception as fallback_error:
                             print(f"降级到medium模型也失败: {str(fallback_error)}")
                             raise  # 重新抛出异常
@@ -762,6 +715,13 @@ class AudioProcessor:
                 print(f"音频信号强度 RMS = {rms:.6f}")
             
             # 记录音频数据的统计信息，但仅在启用时显示
+            #
+            # 注意：这一处是**同步版** `process_audio` 里的老代码，实际跑的是
+            # `process_audio_async` → `WhisperThreadPool`，那条路根本不走这里。所以
+            # 界面上的「显示音频数据统计信息」以前是勾了没反应（这个键就只有这里读）。
+            # 现在那个选项由采集侧供给、界面显示（`AudioManager.get_audio_stats`
+            # / `MainWindow.update_audio_stats_label`）；这段保留是因为同步接口本身
+            # 还能用（命令行/测试里调得到），键名照旧。
             if config.get("show_audio_stats", False):
                 print(f"音频数据统计: 类型={audio_data.dtype}, 形状={audio_data.shape}, 最小值={np.min(audio_data)}, 最大值={np.max(audio_data)}")
             

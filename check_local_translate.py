@@ -36,6 +36,7 @@ import time
 import requests
 
 from config import config
+from translation.echo_guard import ECHO_MARKERS
 from translation.local_llm_translator import LocalLLMTranslator
 from translation.subtitle_manager import SubtitleManager
 
@@ -52,11 +53,10 @@ CASES = [
 
 DEAD_URL = "http://127.0.0.1:9"   # 9 号端口（discard）不会有人监听
 
-# 译文里**不该**出现的东西：提示词自己的残渣。思考型模型（实测 Spark-X2.5-1.7B）就算
-# 用 "think": false 关掉了思考，也会把 "Source: …\nChinese:" 这套脚手架接在译文后面
-# 一起吐出来（"收到，来源：罗杰，收到，。" / "您的信号是59\n。中文"）。术语倒是都在，
-# 只看术语会判它"通过"——所以这类残渣单独算不过。
-ECHO_MARKERS = ["来源：", "来源:", "Source:", "中文:", "中文：", "English:"]
+# 注：残渣清单（`ECHO_MARKERS`）现在放在 `translation/echo_guard.py`，生产代码
+# （`LocalLLMTranslator._translate_one`）用的是同一份。这份清单原来只活在本脚本里，
+# 结果是脚本能把残渣判出来、字幕上照样带着残渣出去（本机 12 个字幕文件里 11 条）。
+# 这里 import 过来用，别再各写一份。
 
 
 def _fmt_ms(seconds):

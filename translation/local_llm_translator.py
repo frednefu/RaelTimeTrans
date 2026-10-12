@@ -69,6 +69,8 @@ import time
 import requests
 
 from config import config
+from text_guards import truncate_repetition
+from translation.echo_guard import is_echo, strip_echo
 
 
 # 语言名映射：界面上存的是中文显示名（"中文"），Google 那边用的是语言代码（"zh-cn"），
@@ -128,6 +130,21 @@ def language_code(value, default=""):
 def language_name(value, default=None):
     """同上，但要的是提示词里的英文语言名；认不出来就返回 default（None = 未知）"""
     return _LANGUAGE_NAMES.get(language_code(value), default)
+
+
+def _model_key(name):
+    """模型名归一成"用来比较是不是同一个"的键：小写、去掉 `:latest` 后缀
+
+    Ollama 的 `/api/ps` 报的是带 tag 的全名（`cas/eurollm-1.7b-instruct-q8:latest`），
+    而配置里常常写的是裸名（"cas/eurollm-1.7b-instruct-q8"）—— 直接比字符串会判成
+    "不是同一个"，`unload_others` 于是清不掉该清的那个。别的 tag（`:7b`）保留：
+    那可能是另一个模型，不该混为一谈。
+    """
+    key = str(name or "").strip().lower()
+    head, sep, tag = key.rpartition(":")
+    if sep and tag == "latest":
+        return head
+    return key
 
 
 # 术语标记的形态。TermManager 生成的一定是 __TERM_0__，这里放宽一点是为了认得出
@@ -463,12 +480,17 @@ class LocalLLMTranslator:
         keep = set([keep] if isinstance(keep, str) else (keep or []))
         keep.discard("")
         keep.add(self._model())
+        # 归一化之后再比：`/api/ps` 报的名字可能带 `:tag`（"qwen2.5:7b"），而配置里
+        # 写的是不带 tag 的裸名（或反过来）—— 直接 `name in keep` 会漏判，于是"清场"
+        # 清不掉该清的那个，老模型与新模型同驻，Ollama 为腾地方把正在用的挤掉重载
+        # （日志 aborting load），界面上就是"某些句子突然回落成原文"。
+        keep_keys = set(_model_key(name) for name in keep)
         resident = self.resident_models()
         if not resident:
             return 0
         count = 0
         for name, _size_mib, _expires in resident:
-            if name in keep:
+            if _model_key(name) in keep_keys:
                 continue
             if self.unload(name):
                 count += 1
@@ -505,8 +527,17 @@ class LocalLLMTranslator:
                 pieces.append(chunk)
                 continue
             translated = self._translate_one(core, target_language, source_language)
+            if translated is None and self._warm_model != self._model():
+                # 这一条失败得像是"模型又被卸了/还没加载"：`_translate_one` 已经清掉
+                # `_warm_model`，下一次请求自动按加载放宽到 `_LOAD_READ_TIMEOUT_S`。
+                # 带 N 个术语的句子要发 N+1 条请求，撞上冷加载的概率不低（第一条把它
+                # 拉起来、后面几条就顺了），重试一次远好过整句回落成原文。
+                # 模型明明热着却答不出来（回显、空译文）时不重试：那是内容问题，
+                # 同一句问第二遍（temperature=0）结果一样，白等一轮。
+                translated = self._translate_one(core, target_language, source_language)
             if translated is None:
                 # 有一段没翻成，整体算失败：宁可回落一整句，也不要拼出半句
+                self.last_error = "片段翻译失败：%s" % (self.last_error or "未知原因")
                 return None
             lead = chunk[:len(chunk) - len(chunk.lstrip())]
             trail = chunk[len(chunk.rstrip()):]
@@ -544,10 +575,25 @@ class LocalLLMTranslator:
         if not content:
             self.last_error = self._empty_error(data)
             return None
+        # 拿到内容就说明模型确确实实在显存里了：先记上"热"，下面几条失败判据
+        # （残渣、回显）都是"模型在，但它答得不对"，别把它们误当成冷加载去重试。
+        self._warm_model = self._model()
+        # 提示词残渣（"收到，来源：罗杰，收到，。" / "…59\n。中文"）：剥掉再上屏，
+        # 不整句丢弃 —— 残渣前面那半句译文通常是好的。剥完什么都不剩才算失败。
+        cleaned = strip_echo(content)
+        if not cleaned:
+            self.last_error = "模型只吐出了提示词脚手架，没有译文：%s" % content[:80]
+            return None
+        # 退化复读（"笨拙的笨拙的…"×60）：只砍尾巴，前面那半句留着（repeat_penalty 之外的兜底）
+        cleaned = truncate_repetition(cleaned)
+        if is_echo(cleaned, source_text):
+            # 原文一字不差地"翻"回来 = 回显，不是翻译。当成失败抛给上层（它会按失败
+            # 处理：回落原文、不进缓存），总好过把原文当译文贴上屏幕和 SRT。
+            self.last_error = "模型原样回显了原文（没翻译）：%s" % cleaned[:80]
+            return None
         self.last_error = None
-        self._warm_model = self._model()   # 这个模型已经在显存里了
         self._record_stats(data, started)
-        return content
+        return cleaned
 
     def _request_error(self, error, cold, timeout_ms):
         """超时要说清是"加载慢"还是"模型又被卸了"，别让人对着 ReadTimeout 猜"""
@@ -599,6 +645,14 @@ class LocalLLMTranslator:
             "temperature": float(config.get("local_llm_temperature", 0.0) or 0.0),
             "num_predict": num_predict,
             "num_ctx": int(config.get("local_llm_num_ctx", 2048) or 2048),
+            # 复读惩罚：temperature=0 的贪心解码偶尔会掉进复读循环，实测吐出
+            # "笨拙的笨拙的笨拙的…" 一路把 num_predict 用完（`truncate_repetition`
+            # 是输出侧的兜底，这里是主防线）。1.15 足够打断循环，又不至于把
+            # "CQ CQ"、"59 59" 这种本该重复的通联用语罚变形。
+            # 这两个是**采样期**参数（不是 num_ctx 那种加载期参数），所以和 preload
+            # 的 num_predict=1 并存没问题，不会引起重载。
+            "repeat_penalty": 1.15,
+            "repeat_last_n": 64,
         }
 
     def _payload(self, text, target_language, source_language=None):

@@ -12,7 +12,8 @@
 流式识别（见 audio/simul_asr.py）之后多了一种请求：**前缀翻译**。边上屏边
 翻译同一句话的半截原文（kind="prefix"），定稿后再翻整句（kind="final"）。
 两者走同一个线程、同一个队列，靠 kind 区分；关键是积压时**优先保终稿**——
-把终稿丢掉只翻前缀的话，那句的正式译文就永远不来了。
+把终稿丢掉只翻前缀的话，那句的正式译文就永远不来了（`_coalesce` 那里现在
+"终稿一条都不丢、只丢被取代的前缀"）。
 """
 
 import itertools
@@ -106,29 +107,42 @@ class TranslationWorker:
             except queue.Empty:
                 continue
 
-            # 积压说明识别速度已经超过翻译速度了。继续逐条补翻只会让字幕越来越
-            # 滞后，所以只翻最新的一条，把中间的丢掉——反正界面也早就不显示它们了。
-            pending = []
-            while True:
+            for job in self._coalesce(request):
+                if not self._running:
+                    return
+                seq, text, target, kind = job
                 try:
-                    pending.append(self._requests.get_nowait())
-                except queue.Empty:
-                    break
-            if pending:
-                # 终稿优先：同一批里只要有终稿就翻最后那条终稿。终稿要是被前缀
-                # 挤掉，这一句就没有正式译文了（前缀文本短一截，还会被界面丢掉）。
-                finals = [item for item in pending if item[3] == KIND_FINAL]
-                keep = finals[-1] if finals else pending[-1]
-                self.skipped_requests += len(pending) - 1
-                print(f"翻译积压，跳过 {len(pending) - 1} 条较旧的文本，"
-                      f"只翻译最新的{'终稿' if finals else '前缀'}")
-                request = keep
+                    translation = self._translate(text, target)
+                except Exception as e:
+                    print(f"后台翻译失败: {str(e)}")
+                    translation = ""
+                self._results.put((seq, text, translation, kind))
 
-            seq, text, target, kind = request
+    def _coalesce(self, request):
+        """把积压的一批请求压成"真正要翻的那几条"，返回按顺序要执行的作业表
+
+        积压说明识别速度已经超过翻译速度了，继续逐条补翻只会让字幕越来越滞后。但
+        **能丢的只有前缀**（后到的前缀本来就是"更长的同一句话"，界面只显示最新那条），
+        **终稿一个都不能丢**：终稿是这句话唯一一次正式翻译，丢了它这一句就永远只有
+        原文（用户报的"有时候直接显示原文"里就有这条，本机 SRT 里出现过连缺五句）。
+        原来这里只保留"最后一条终稿"，同一批里的其它终稿直接扔掉，正是那个形状。
+
+        于是：全部终稿照翻，前缀只留最新的一条（终稿在的话它其实也已经作废了，
+        留着只是给下一句的逐词显示多一份料）。
+        """
+        pending = []
+        while True:
             try:
-                translation = self._translate(text, target)
-            except Exception as e:
-                print(f"后台翻译失败: {str(e)}")
-                translation = ""
-
-            self._results.put((seq, text, translation, kind))
+                pending.append(self._requests.get_nowait())
+            except queue.Empty:
+                break
+        batch = [request] + pending
+        finals = [item for item in batch if item[3] == KIND_FINAL]
+        prefixes = [item for item in batch if item[3] != KIND_FINAL]
+        keep = finals + (prefixes[-1:] if prefixes else [])
+        dropped = len(batch) - len(keep)
+        if dropped > 0:
+            self.skipped_requests += dropped
+            print(f"翻译积压，跳过 {dropped} 条被取代的前缀，"
+                  f"翻 {len(keep)} 条（终稿 {len(finals)} 条、前缀 {len(keep) - len(finals)} 条）")
+        return keep

@@ -165,8 +165,9 @@ class SubtitleManager:
             except Exception as e:
                 if debug:
                     print(f"翻译环节出错: {str(e)}")
-                # 如果翻译失败，返回处理后的文本
-                return processed_text
+                # 如果翻译失败，返回处理后的文本（**先过一遍术语还原/抠除**，
+                # 绝不让 __TERM_0__ 这种机器码上屏）
+                return self._fallback_text(processed_text, replacements)
 
             # 步骤6: 还原术语占位符
             try:
@@ -183,7 +184,10 @@ class SubtitleManager:
 
                 # 两轮还原之后还留着，说明模型把占位符写得太花、匹配不上了：把残骸抠掉。
                 # 字幕上绝不能出现 __TERM_0__ 这种机器码（代价是这个术语的译文丢了）。
-                if replacements and 'TERM' in final_text.upper():
+                # **不要求 replacements 非空**：模型自己也会编出 __TERM_0__（system
+                # 提示词里提到过这个形状，思考型模型会把脚手架连同它一起吐回来），
+                # 这时没有对照表可还原，只能抠掉（本机 SRT 实测两条就是这么来的）。
+                if 'TERM' in final_text.upper():
                     final_text = strip_leftover_placeholders(final_text)
 
                 if debug:
@@ -211,11 +215,33 @@ class SubtitleManager:
             # 优先返回经过呼号处理的文本，这样至少保留了基本处理
             try:
                 if 'processed_text' in locals():
-                    return processed_text
+                    return self._fallback_text(processed_text, locals().get('replacements'))
                 else:
                     return text
             except:
                 return text
+
+    def _fallback_text(self, text, replacements):
+        """回落时能给出的最好文本：术语标记一律还原，还原不了就抠掉
+
+        第 5 步失败时返回的是"处理过术语、但还没翻译"的文本，正常路径上它不该带标记
+        （带标记的是 `preprocessed_text` 那个变量）。但有两条路会让标记漏出去：
+
+        1. 模型自己编出 `__TERM_0__`——system 提示词里提到了这个形状，思考型模型会把
+           脚手架连同它一起吐回来，而这时 `replacements` 是空的，第 6 步的还原整段跳过；
+        2. 第 5 步失败/超时之后回落，正好拿到一份带标记的文本。
+
+        所以回落这条路也过一遍：有对照表就还原（术语译文能保住），没有就抠掉（丢一个
+        术语，但绝不把机器码送上屏幕和 SRT）。
+        """
+        if not text:
+            return text
+        if "term" not in text.lower():
+            return text
+        if replacements:
+            text = normalize_placeholders(text)
+            text = self.term_manager.restore_ham_radio_terms(text, replacements)
+        return strip_leftover_placeholders(text)
     
     def _backend_signature(self):
         """缓存键的一部分：换了引擎/模型/地址，旧译文就不该再命中"""

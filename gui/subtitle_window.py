@@ -24,8 +24,11 @@ REVEAL_LEFT_MARGIN = 32
 REVEAL_SCROLL_MS = 200
 
 # 译文行框里最多留几行（超出的往上滚，见 `_sync_translation_scroll`）。
-# 译文不像原文有"上一句"要对照，留两行够看清当前这句长什么样。
-TRANSLATION_ROWS = 2
+# 2026-10 从 2 改成 3：**多出来的那一行留给"上一句"**——原来译文行只有当前这一句，
+# 下一句译文一到就整行覆盖，长译文还没看完就没了（用户报的"还没看完就显示下一行，
+# 应该向上滚动"）。3 行 = 上一句译文 1 行（超长截断，像原文行那样）+ 当前句 2 行
+# （太长就在这两行里往上滚）。想退回旧行为把这个数改回 2 即可。
+TRANSLATION_ROWS = 3
 # 译文行一次滚动最长多久（毫秒）：整句译文一下折成很多行时按行数延时滑过去，
 # 免得看着像瞬移；一行的滚动仍是 REVEAL_SCROLL_MS，和原文行一个手感。
 MAX_TRANSLATION_SCROLL_MS = 600
@@ -174,6 +177,16 @@ class SubtitleWindow(QMainWindow):
         # 可以换，只挪偏移，不会露出错的中间帧。
         self._t_scroll_anim = None
         self._t_scroll_target = 0
+
+        # 译文行的"上一句 + 当前句"（见 `_update_translation_line`）。`_translation_prev`
+        # 是上一句的译文（显示在框顶那一行、超长截断），`_translation_current` 是当前句
+        # 还没组合的译文原文（组合后的文本在标签里，不能拿标签文本当"当前句"用）。
+        # `_translation_current_final` / `_translation_key` 决定"新文本是同一句的更新
+        # （替换）还是新的一句（把当前这行降级成上一句）"。
+        self._translation_prev = ""
+        self._translation_current = ""
+        self._translation_current_final = False
+        self._translation_key = None
 
         # 布局状态：当前三处间隙多大（见 `_apply_row_gaps`）、窗口高度是不是跟着内容
         # 自动走（用户自己改过高度就锁定，见 `_fit_window_height`）、以及这次 resize
@@ -331,6 +344,11 @@ class SubtitleWindow(QMainWindow):
             self._reveal_utterance_id = None
             # 原文行在这个模式下不显示：清空它，免得切回"两者"时闪一眼上一句旧文本
             self.original_label.setText("")
+        # "上一句译文"同理：切到"不翻译"/"仅显示原文"时它不该留在框里
+        if self.translation_disabled() or mode == "original":
+            self._reset_translation_lines()
+            if self.translation_label.text():
+                self.translation_label.setText("")
         # 更新标签可见性
         self.update_labels_visibility()
         # 上下内边距是按模式定的（两行模式下是 0，见 `_label_vpadding`），模式一换
@@ -374,8 +392,19 @@ class SubtitleWindow(QMainWindow):
         """标签所在的裁剪框"""
         return self.original_view if label is self.original_label else self.translation_view
     
-    def update_text(self, original_text=None, translation_text=None):
-        """更新字幕文本"""
+    def update_text(self, original_text=None, translation_text=None,
+                    translation_key=None, translation_final=False):
+        """更新字幕文本
+
+        `translation_key` / `translation_final` 只给译文行用：**同一句的前缀译文和
+        整句译文共用一把 key**，字幕窗据此决定新文本是"替换当前这一行"还是"新的一句"
+        （后者把当前这行降级成上一句、留在框顶那一行，见 `_update_translation_line`）。
+        不给 key（旧调用、检查脚本）时按"原地替换"处理，行为与原来一致。
+
+        `translation_text` 传空串等于**什么都不做**（以前它会清空译文行）：译文行的
+        "上一句"是字幕窗自己攒的，随手清掉就没有上下文可翻了。要真清空请调
+        `clear_translation()`。
+        """
         # 检查是否需要更新
         needs_update = False
 
@@ -400,9 +429,10 @@ class SubtitleWindow(QMainWindow):
                 self._set_sentence_text(self.original_label, original_text)
 
             # 设置译文（如果提供）
-            if translation_text is not None and translation_text != self.translation_label.text():
-                needs_update = True
-                self._set_sentence_text(self.translation_label, translation_text)
+            if translation_text is not None:
+                if self._update_translation_line(translation_text, translation_key,
+                                                 translation_final):
+                    needs_update = True
         # 注意：这里**没有**"翻译模式下还没译文就拿原文顶上去"那一手（原来有）。那一手
         # 正是"仅显示译文时先冒一句原文、还穿着译文的颜色和字号"的由来——原文行那时是
         # 藏着的，所以顶替的是译文行。现在译文行只由真正的译文（含"边说边译"的前缀）
@@ -476,6 +506,58 @@ class SubtitleWindow(QMainWindow):
         行占位（见 `_word_reveal_visible`），所以这里不再需要按逐词开关分情况。
         """
         return not (self.translation_disabled() or self.subtitle_mode == "original")
+
+    def _update_translation_line(self, translation, key=None, is_final=False):
+        """写译文行：新的一句到了，把上一句留在框顶那一行（不再整行清掉）
+
+        什么时候"翻页"（当前这行降级成"上一句"）只有两条判据：
+
+        - **整句译文到达**：当前这行本身就装着一句整句译文、而且不是同一句
+          （`key` 不同，或者调用方根本没给 key）→ 翻页；否则原地替换。
+          同一句的"前缀译文 → 整句译文"共用一把 key，所以终稿是**替换**那半截，
+          不是把它顶到上面去（那样屏幕上会出现两遍几乎一样的话）。
+        - **前缀译文到达**：当前这行装着整句译文（只能是上一句的，同一句的整句
+          不可能先于它的前缀）→ 先把整句顶上去，再原地写前缀。
+
+        返回 True 表示这一行确实变了（调用方要重排）。文本没变直接返回 False：
+        200ms 轮询会反复叫它，无端重排会让滚动动画一直重启。
+        """
+        if not translation or translation == self._translation_current:
+            return False
+
+        rotate = False
+        if self._translation_current:
+            if is_final:
+                same_sentence = (key is not None and key == self._translation_key)
+                rotate = self._translation_current_final and not same_sentence
+            else:
+                rotate = self._translation_current_final
+        if rotate:
+            self._translation_prev = self._translation_current
+        self._translation_current = translation
+        self._translation_current_final = bool(is_final)
+        if key is not None:
+            self._translation_key = key
+
+        # 标签里装的是"上一句 + 当前句"的组合文本，`_translation_current` 才是当前句
+        # （拿标签文本当当前句用，下一次比较就会把组合整段当"新文本"）。
+        self._set_sentence_text(self.translation_label, self._compose_translation_text())
+        return True
+
+    def _compose_translation_text(self):
+        """译文行的组合文本：当前句在下面，上一句截断成一行放上面
+
+        和原文行（`_compose_reveal_text`）同一个道理：上一句太长就截断加省略号，
+        保证当前句永远看得见。上一句那一行在译文行归视口管时才给（见
+        `_translation_reveal`），否则整句通路是居中的，两行组合反而别扭。
+        """
+        prev = self._translation_prev
+        if not prev or not self._translation_reveal():
+            return self._translation_current
+        metrics = QFontMetrics(self.translation_label.font())
+        prev = metrics.elidedText(prev, Qt.TextElideMode.ElideRight,
+                                  self._reveal_avail_width(self.translation_label))
+        return f"{prev}\n{self._translation_current}"
 
     def _set_label_inset(self, label, inset):
         if label is self.original_label:
@@ -594,6 +676,8 @@ class SubtitleWindow(QMainWindow):
         """
         self._stop_reveal_scroll()
         self._stop_translation_scroll(reset=True)
+        # 新的一轮："上一句译文"是上一轮的，不能留着
+        self._reset_translation_lines()
         self._reveal_utterance_id = None
         self._apply_reveal_layout(self.original_label)
         if not self._translation_reveal():
@@ -805,10 +889,22 @@ class SubtitleWindow(QMainWindow):
         # 盒高也得跟着收回来（`_set_translation_rows` 是对账点），不然这行会一直
         # 挂着上一句折行时撑出来的高度，直到下一轮 QTimer 轮询才发现。
         self._stop_translation_scroll(reset=True)
+        self._reset_translation_lines()
         if self.translation_label.text():
             self.translation_label.setText("")
         self._set_translation_rows()
         self.update_labels_visibility()
+
+    def _reset_translation_lines(self):
+        """把"上一句 + 当前句"那套状态清干净（切模式、重开一轮、清空译文时用）
+
+        只清状态、不动标签文本：调用方各有各的写法（`clear_translation` 要把标签
+        清空，`reset_reveal_layout` 只是重排）。
+        """
+        self._translation_prev = ""
+        self._translation_current = ""
+        self._translation_current_final = False
+        self._translation_key = None
 
     def set_text(self, original_text="", translation_text=""):
         """设置预览文本"""
@@ -817,6 +913,10 @@ class SubtitleWindow(QMainWindow):
             self._set_sentence_text(self.original_label, original_text)
 
         if translation_text is not None:
+            # 预览是一句定死的话，不参与"上一句"那套翻页（见 `_update_translation_line`）：
+            # 不清掉的话，预览之后第一句真译文的 key/整句标记会和它对上/对不上地乱翻页
+            self._reset_translation_lines()
+            self._translation_current = translation_text
             self._set_sentence_text(self.translation_label, translation_text)
 
         # 确保标签高度正确

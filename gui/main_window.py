@@ -299,9 +299,22 @@ class MainWindow(QMainWindow):
 
         device_layout.addLayout(input_layout)
         device_layout.addLayout(output_layout)
+        # 勾上「显示音频数据统计信息」之后真正显示统计的地方（原来是勾了什么都不发生：
+        # 那个配置键只有一段已经不跑的旧代码读它，界面上从来没有显示的地方）。
+        # 只读，跟着音量表那个定时器一起刷新——见 `update_audio_stats_label`。
+        self.audio_stats_label = QLabel("")
+        self.audio_stats_label.setWordWrap(True)
+        self.audio_stats_label.setStyleSheet(
+            "color: #555555; font-family: Consolas, monospace;")
+        self.audio_stats_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        # 显隐跟着勾选框走（复选框的初始状态来自配置），不各读一遍配置
+        self.audio_stats_label.setVisible(self.show_audio_stats_checkbox.isChecked())
+
         device_layout.addWidget(self.monitor_checkbox)
         device_layout.addWidget(self.monitor_hint_label)
         device_layout.addWidget(self.show_audio_stats_checkbox)
+        device_layout.addWidget(self.audio_stats_label)
         device_group.setLayout(device_layout)
         
         # 翻译设置部分
@@ -1149,6 +1162,26 @@ class MainWindow(QMainWindow):
             self.output_volume_meter.set_level(self.audio_manager.get_output_volume())
         # 播放失败要马上在界面上显示原因，而不是只在控制台打日志
         self.update_monitor_hint()
+        self.update_audio_stats_label()
+
+    def update_audio_stats_label(self):
+        """把最近一块音频的统计写进 `audio_stats_label`（勾选项关着时什么都不做）
+
+        节拍用音量表这个 80ms 定时器，不是那个 200ms 的翻译定时器：后者**只在翻译
+        进行中才跑**（`self.timer` 在停止时被 stop），而统计恰恰要看"停了之后归零"
+        （录音一停，`get_audio_stats` 就超过 0.5 秒没更新，峰值/RMS 回零）。两个音量条
+        就在同一行上，同一个节拍也方便对照着看。
+        """
+        if not self.audio_stats_label.isVisible():
+            return
+        stats = self.audio_manager.get_audio_stats()
+        self.audio_stats_label.setText(
+            "音频统计：%d Hz，每块 %d 样（%.0f ms）｜本块峰值 %.1f%%、RMS %.1f%%｜"
+            "本轮已采集 %.1f s（有语音 %.1f s，共 %d 块）｜底噪 %.0f、判定阈值 %.0f"
+            % (stats["sample_rate"], stats["chunk_samples"], stats["chunk_ms"],
+               stats["peak"] * 100.0, stats["rms"] * 100.0,
+               stats["captured_sec"], stats["voiced_sec"], stats["chunks"],
+               stats["noise_floor"], stats["speech_threshold"]))
 
     def _refresh_input_monitor(self):
         """根据当前选择的输入设备与运行状态，开启/停止音量监听"""
@@ -1705,7 +1738,10 @@ class MainWindow(QMainWindow):
         if self.subtitle_preview.isVisible():
             self.subtitle_preview.setText(translation)
         if self.subtitle_window.isVisible():
-            self.subtitle_window.update_text(translation_text=translation)
+            # 不是整句：字幕窗据此把它当"同一句的最新半截"原地替换，不翻页
+            self.subtitle_window.update_text(translation_text=translation,
+                                             translation_key=utterance_id,
+                                             translation_final=False)
 
     def _show_original_text(self, text):
         """把原文立刻显示到预览区和字幕窗口（不等翻译）"""
@@ -1722,7 +1758,13 @@ class MainWindow(QMainWindow):
             # 那一行现在宁可空着（勾了「译文逐词显示」的话，译文会跟着语音一段段长）。
             return
 
-        self.subtitle_window.update_text(original_text=text, translation_text="")
+        self.subtitle_window.update_text(original_text=text)
+        # 注意这里**不动译文行**：原来传的是 `translation_text=""`，那时它的意思是
+        # "把上一句译文清掉"，而清掉之后新译文到达时框里已经没有上一句可以翻了——
+        # 用户报的"译文很长还没看完就被清掉"正是这个形状。现在译文行由
+        # `SubtitleWindow._update_translation_line` 自己管：新的一句译文到达时，
+        # 旧的那句会留在框顶那一行，直到被更新的一句顶上去（要真清空走
+        # `clear_translation()`，切"不翻译"时用它）。
 
     def _apply_translation(self, text, translation):
         """译文就绪：更新预览区和字幕窗口"""
@@ -1735,15 +1777,45 @@ class MainWindow(QMainWindow):
         print(f"应用译文（模式={subtitle_mode}）: '{translation[:30]}...'")
 
         if self.subtitle_window.isVisible():
+            # 整句译文：字幕窗会先把上一句留在框顶那一行（长译文不再被整行清掉）
+            key = self._final_translation_key(text)
             if config.get("word_by_word_enabled", True):
                 # 原文行正由逐词通道负责，这里只补译文，别用整句原文盖掉它
-                self.subtitle_window.update_text(translation_text=translation)
+                self.subtitle_window.update_text(translation_text=translation,
+                                                 translation_key=key,
+                                                 translation_final=True)
             else:
                 self.subtitle_window.update_text(original_text=text,
-                                                 translation_text=translation)
+                                                 translation_text=translation,
+                                                 translation_key=key,
+                                                 translation_final=True)
+
+    def _final_translation_key(self, text):
+        """这一句整句译文属于哪一句：有句号就用句号，没有就退回原文文本
+
+        句号（`_finalized_utterance`）是"是不是同一句"的正解——同一句话的**半截译文
+        和整句译文共用它**，字幕窗据此决定终稿是"替换当前这行"（同一句）还是"把当前
+        这行降级成上一句"（新的一句）。拿不到句号（「原文逐词显示」关掉时没有词段，
+        也就没有句号）就退回原文文本：那时本来也没有半截译文，退化成"每句翻页"，
+        正是要的效果。
+        """
+        if (self._finalized_utterance is not None
+                and text == self.current_displayed_text):
+            return self._finalized_utterance
+        return text
 
     def _is_same_language(self, text):
-        """判断识别出的源语言是否就是目标语言"""
+        """判断识别出的源语言是否就是目标语言
+
+        **只在用户显式指定了源语言时才允许"同语种就跳过翻译"**。默认的
+        `source_language = "auto"` 下这条一律不成立，理由是它过去造成的一类字幕：
+        检测语种取自最近 5 条结果的**多数票**（`AudioManager.get_detected_language`），
+        音频里两种语言交替时很容易投成目标语言，于是代码直接**把原文当译文上屏**、
+        连翻译请求都不发——屏幕上就是"有时候直接显示原文"。误检的代价从"整句没翻"
+        变成"多翻一次"，后者便宜得多。
+        """
+        if config.get("source_language", "auto") in ("auto", "", None):
+            return False
         detected = self.audio_manager.get_detected_language()
         if not detected:
             return False
@@ -2628,6 +2700,9 @@ class MainWindow(QMainWindow):
         """音频数据统计选项改变时的处理"""
         show_stats = state == Qt.CheckState.Checked.value
         config.set("show_audio_stats", show_stats)
-        
+
+        # 立即生效：勾上马上就有数（下一拍 80ms 就填上），取消马上收起来
+        self.audio_stats_label.setVisible(show_stats)
+
         if DEBUG_MODE:
             print(f"音频数据统计选项更改为: {show_stats}")

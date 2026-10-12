@@ -12,7 +12,10 @@
   tiny~medium），两个后端各记各的键，**流式后端下回填整句模型名不许写进 `simul_model`**
   ——合并最容易踩的就是这个坑；另外流式那两行和整句的状态行要按后端显隐；
 - 两个逐词开关（「原文逐词显示」/「译文逐词显示」）都在字幕样式组里、勾选状态来自
-  配置；译文刷新间隔不在流式那一组里（两种后端都吃）。
+  配置；译文刷新间隔不在流式那一组里（两种后端都吃）；
+- 「显示音频数据统计信息」勾上之后**界面上真的有数**（以前这个键只有一段已经不跑的
+  旧代码读它，勾了什么都不发生）：统计行的显隐跟着复选框、喂一块假音频就显示采样率/
+  块大小/峰值/本轮时长，停止采集半秒后瞬时值回零。
 
 `MainWindow` 的 `resizeEvent` 会存窗口大小，所以脚本会写 settings.json：跑之前备份、
 退出时原样放回（`finally` 里），用户的设置不会被动。
@@ -24,6 +27,8 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # 必须赶在导入 PySide6 之前
 
 from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QScrollArea  # noqa: E402
+
+import numpy as np  # noqa: E402
 
 from config import config  # noqa: E402
 from model_residency import model_residency  # noqa: E402
@@ -194,6 +199,41 @@ def main():
         app.processEvents()
         check(not window.simul_prefix_spin.isHidden(),
               "流式后端下也在")
+
+        print("— 「显示音频数据统计信息」勾了真的要显示东西 —")
+        stats_label = window.audio_stats_label
+        check(stats_label.parent() is window.show_audio_stats_checkbox.parent(),
+              "统计行和「显示音频数据统计信息」复选框在同一个组里")
+        # 显隐一律跟着复选框走（复选框的初始状态来自配置）
+        window.show_audio_stats_checkbox.setChecked(False)
+        app.processEvents()
+        check(not stats_label.isVisible(), "没勾的时候收起来")
+        check(config.get("show_audio_stats") is False, "勾选状态写回了配置")
+        window.show_audio_stats_checkbox.setChecked(True)
+        app.processEvents()
+        check(stats_label.isVisible(), "勾上之后露出来")
+
+        # 喂一块假音频：标签里必须有真数据（这个选项以前是勾了什么都不发生）
+        window.audio_manager.reset_audio_stats()
+        window.audio_manager._update_audio_stats(
+            np.full(1024, 3277, dtype=np.int16), False, 120.0, 350.0)
+        window.update_audio_stats_label()
+        stats_text = stats_label.text()
+        check("音频统计" in stats_text and "16000 Hz" in stats_text
+              and "1024 样" in stats_text and "64 ms" in stats_text,
+              f"采样率/块大小显示出来了：{stats_text}")
+        check("本块峰值 10.0%、RMS 10.0%" in stats_text,
+              "本块的峰值/RMS 按百分比显示（3277/32768 = 10.0%）")
+        check("本轮已采集 0.1 s（有语音 0.1 s，共 1 块）" in stats_text,
+              "本轮累计时长/语音时长/块数都对得上（1024 样 = 64ms）")
+        check("底噪 120、判定阈值 350" in stats_text, "VAD 那两个数来自采集线程")
+
+        # 停止采集半秒之后瞬时值要回零（不然界面上挂着一个不动的数字，像还在采）
+        window.audio_manager._audio_stats["updated_at"] = time.time() - 10
+        window.update_audio_stats_label()
+        check("本块峰值 0.0%、RMS 0.0%" in stats_label.text()
+              and "本轮已采集 0.1 s" in stats_label.text(),
+              "停采之后瞬时值回零、本轮累计还留着")
 
         window.close()
     finally:

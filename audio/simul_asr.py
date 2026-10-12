@@ -30,6 +30,8 @@ from collections import namedtuple
 
 import numpy as np
 
+from text_guards import is_redundant_segment
+
 SAMPLE_RATE = 16000          # 上游把这个采样率写死在 OnlineProcessorInterface 里
 _CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "whisper")
 
@@ -127,6 +129,8 @@ class SimulStreamingEngine:
         self.commit_count = 0
         self.last_commit_ms = 0
         self.utterance_id = None
+        # 被"重复片段"判据拦下的段数（一句话只判一次语言，卡住时这个数会一直涨）
+        self.rejected_segments = 0
 
         self._asr = None
         self._online = None
@@ -380,25 +384,46 @@ class SimulStreamingEngine:
     def _reset(self):
         self._words = []
         self._parts = []
+        self.rejected_segments = 0
 
     def _absorb(self, out):
-        """把上游这一次的结果并进累积值（它只回当前这一段，见模块开头第 1 条）"""
-        for word in (out or {}).get("words") or []:
+        """把上游这一次的结果并进累积值（它只回当前这一段，见模块开头第 1 条）
+
+        返回"这次有没有真的加进东西"。返回 False 就是**这一段没有进展**：要么上游
+        把同一段重发了一遍（按词起点去重吃掉），要么这一段是前面内容的重复——
+        后者是引擎卡住的典型症状（每句话只检测一次语言，中英交替时后半段解不出来，
+        反复吐同一个词），也是"原文一直重复显示 youtube"的直接来源。
+        调用方（`AudioManager._stream_recognize`）拿这个返回值判停滞、决定要不要断句。
+        """
+        out = out or {}
+        words = out.get("words") or []
+        text = (out.get("text") or "").strip()
+
+        # 整段是重复：连它的词一起丢掉。留着词的话逐词通路照样会把
+        # "youtube youtube youtube" 一个词一个词地显示出来。
+        if text and is_redundant_segment(text, self._parts):
+            self.rejected_segments += 1
+            return False
+
+        added = False
+        for word in words:
             try:
                 start = float(word["start"])
                 end = float(word["end"])
             except (KeyError, TypeError, ValueError):
                 continue
-            text = (word.get("text") or word.get("word") or "").strip()
-            if not text:
+            text_word = (word.get("text") or word.get("word") or "").strip()
+            if not text_word:
                 continue
             if any(abs(start - seen.start) < 1e-6 for seen in self._words):
                 continue                    # 同一段被重复提交过，别把同一个词攒两份
-            self._words.append(StreamWord(text, start, max(start, end)))
+            self._words.append(StreamWord(text_word, start, max(start, end)))
+            added = True
         self._words.sort(key=lambda w: w.start)
-        text = (out or {}).get("text") or ""
-        if text.strip() and text.strip() not in self._parts:
-            self._parts.append(text.strip())
+        if text and text not in self._parts:
+            self._parts.append(text)
+            added = True
+        return added
 
     def _result(self, is_final):
         return StreamResult(
