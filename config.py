@@ -42,6 +42,22 @@ class Config:
             "local_llm_num_ctx": 2048,      # 上下文窗口大小
             "local_llm_temperature": 0.0,   # 翻译要的是稳定，默认贪心解码
             "local_llm_fallback_to_google": False,  # 本地失败时是否自动改走谷歌
+
+            # ── 显存回收（见 model_residency.py）──────────────────────────
+            # 反复"开始/停止"之后显存被占满，根因是模型没人放掉。这套开关管的是
+            # "闲下来之后要不要主动还"：停止翻译时模型**故意留着**（下一轮直接复用，
+            # 省掉 2.5 秒加载 + 1.4 GB 重载），真正放掉交给下面这几个。
+            "model_idle_unload_enabled": True,     # 关掉 = 只手动点「释放显存」才放
+            # 闲置多久就把模型放掉（秒，0 = 不按闲置放）。识别模型和本地大模型共用一个值：
+            # 两者对用户的语义都是"停下来之后别占着显卡"，多一个旋钮只会让人不知道该调哪个。
+            # 注意这与 local_llm_keep_alive 是两回事：那个管 Ollama 自己那份策略，
+            # 这个管的是"应用停下来之后别占着显卡"。
+            "model_idle_unload_sec": 300,
+            # 换本地模型时先把它之外的驻留模型清掉：8GB 卡上多个模型同驻会让 Ollama
+            # 为了腾地方把正在用的那个挤掉重载（日志 aborting load），表现为"某些句子
+            # 突然回落成原文"。
+            "unload_previous_llm_on_switch": True,
+
             "window_width": 800,  # 字幕窗口宽度
             "window_height": 200,   # 字幕窗口高度
             # 窗口高度是否跟着内容自动走：True 时高度 = 上/中/下三处间隙 + 各行，

@@ -53,11 +53,31 @@ class TranslationWorker:
         self._thread.start()
 
     def stop(self):
+        """停掉工作线程并清空队列
+
+        线程是 daemon 且只等 1 秒：手上那条已经发出去的请求可能还没回来（冷加载最长
+        120 秒），所以**不能靠 stop 来停住"继续向服务发请求"**——那一段由显存账本的
+        闲置自动卸载兜住（见 model_residency）。
+
+        队列必须抽干：残留的请求会在下次「开始翻译」时被这条线程重新捡起来翻，翻完
+        的译文又没人认领（序号早已作废），白占一次推理、还顺手把模型的 keep_alive
+        续上。`request()` 自己会 `start()`，所以抽干不会影响下次使用。
+        """
         self._running = False
         thread = self._thread
         self._thread = None
         if thread and thread.is_alive():
             thread.join(timeout=1)
+        self.clear_pending()
+
+    def clear_pending(self):
+        """抽干待翻请求与没人取的结果（停止翻译时调）"""
+        for q in (self._requests, self._results):
+            while True:
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
     def request(self, text, target_language, kind=KIND_FINAL):
         """提交一次翻译请求，返回请求序号

@@ -130,12 +130,28 @@ class SimulStreamingEngine:
 
         self._asr = None
         self._online = None
+        self._warmed = False            # CUDA 内核热过没有（见 warmup）
         self._words = []
         self._parts = []
         self._end_sec = 0.0
         self._pending_seconds = 0.0
 
     # ---------------------------------------------------------------- 装载
+
+    @property
+    def signature(self):
+        """这一份引擎的"身份"：影响解码结果的构造参数全在里面
+
+        `AudioManager` 靠它决定"能不能复用上一轮那个引擎"——签名一致就复用（省掉
+        2.5 秒加载 + 1.4 GB 重载），不一致才卸掉重建。所以**任何会让解码行为改变的
+        参数都必须进来**，否则改设置不生效（`commit_interval_ms` 虽是给调用方节流用的、
+        不传给上游，但它同样得过期重建，一并算上）。
+
+        `cache_dir` / `lib_dir` / `logdir` 属于环境而非调参，不进签名。
+        """
+        return (self.model_name, self.frame_threshold, self.commit_interval_ms,
+                self.min_chunk_ms, self.language, self.audio_max_len,
+                self.never_fire, self.max_context_tokens)
 
     @property
     def ready(self):
@@ -192,22 +208,40 @@ class SimulStreamingEngine:
             return False
 
     def unload(self):
-        """把模型放掉（退回整句识别时给显存腾地方）"""
-        self._asr = self._online = None
-        try:
-            import torch
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        """把模型放掉（给显存腾地方：闲置回收、换参数重建、关窗口都走这里）
 
-    def warmup(self, seconds=1.5):
+        必须先 `gc.collect()` 再 `empty_cache()`：torch 的缓存分配器只回收"已经没人
+        引用"的块，而模型对象上挂着一圈引用（上游的 online/asr 互相指），不先断干净
+        就有一大块拿不回来（实测漏掉这一步仍剩几百 MiB）。
+
+        幂等：没加载过也能调。
+        """
+        self._asr = self._online = None
+        self._warmed = False            # 模型没了，CUDA 内核得重编
+        from model_residency import free_cuda_cache
+        free_cuda_cache()
+
+    def reset_session(self):
+        """把"这一句话"的累积状态清掉（词表、文本、时间轴）
+
+        正常路径用不上——`begin_utterance()` 自己会 `init(offset=…)` + `_reset()`。
+        兜的是"上一轮没收尾干净就退出了"（超时未 join 的旧线程、异常退出）这种场景，
+        复用引擎前顺手清一次。
+        """
+        self._reset()
+
+    def warmup(self, seconds=1.5, force=False):
         """开始翻译前热一次：第一次解码要编译 CUDA 内核（本机实测 ~0.8 秒）
 
         走的是和正式识别一样的通路（init → insert_audio_chunk → process_iter），
         不是上游那个 `SimulWhisperASR.warmup()`（它直接往模型的音频缓冲区里塞东西，
         留下的状态会污染第一句话）。
+
+        已经热过就直接返回（`force=True` 可以强制再热）：引擎复用时这一炮是白花的，
+        而 `unload()` 会把 `_warmed` 清掉，所以"卸过再装"一定会重热，不会漏。
         """
+        if self._warmed and not force:
+            return True
         if not self.load():
             return False
         try:
@@ -221,6 +255,7 @@ class SimulStreamingEngine:
             self._online.process_iter()
             self.warmup_ms = int((time.perf_counter() - started) * 1000)
             self._reset()
+            self._warmed = True
             self.last_error = None
             return True
         except Exception as e:

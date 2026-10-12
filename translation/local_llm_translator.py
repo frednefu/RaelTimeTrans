@@ -49,6 +49,15 @@ EuroLLM-1.7B-Instruct-Q8（约 1.8GB 显存）之后单句实测 150~200 毫秒�
    `think: false` 之后 0.43 秒就给译文。实测 EuroLLM-1.7B/9B 与 Spark 都接受这个字段
    （不支持的模型会忽略它），所以这里无脑加。
 
+6. **"用完就还"是这一侧自己的责任**（`unload` / `unload_others`）：每条请求都带
+   `keep_alive: "30m"`，而一句带术语的话要发 N+1 条 —— 等于每 200ms 就把模型续期半小时，
+   所以「停止翻译」之后它照样在显存里挂着。这台机器只有 8 GB，实测切过一次模型就有
+   EuroLLM(1.73GB) + Spark(3.52GB) 同时驻留；再叠上识别模型，Ollama 就会为了腾地方把
+   正在用的那个挤掉重载（日志 `aborting load`），界面上看着是"某些句子突然回落成原文"。
+   所以这里备好"点名卸载"（`unload`）和"清场"（`unload_others`），由 `model_residency`
+   在闲置超时/点「释放显存」/切模型时调用。**卸掉当前模型时必须清 `_warm_model`**，
+   否则下一次请求还按热模型的 3 秒超时发，而它得冷加载，必然超时回落（见要点 4）。
+
 这个类的所有方法**一律不抛异常**（连不上、超时、模型不在都只记进 last_error 并返回
 None/False）：仓库的约定是工作线程里任何一句异常都会毁掉整次识别结果（见 CLAUDE.md），
 所以这里全部吞掉，由调用方决定怎么回落。
@@ -99,6 +108,11 @@ _SYSTEM_PROMPT = ("You are a simultaneous interpretation engine. "
 # 之后一律按 config 里的 local_llm_timeout_ms 走 —— 那是"一句译文等多久算失败"，
 # 和"把 5 GB 模型读进显存"不是一回事。实测 9B-Q4 冷加载 10.8 秒，留足余量。
 _LOAD_READ_TIMEOUT_S = 120.0
+
+# 卸载请求的读超时。卸载本身很快（实测 EuroLLM-1.7B-Q8 约 0.3 秒就从 /api/ps 里消失），
+# 但它可能排在一条正在生成的请求后面，所以别给 2 秒那么紧；也不给 120 秒——这条路会在
+# 界面线程上被调用（定时 sweep / 「释放显存」），卡住界面比卸不掉更糟。
+_UNLOAD_TIMEOUT_S = 20.0
 
 
 def language_code(value, default=""):
@@ -177,6 +191,59 @@ class LocalLLMTranslator:
         # 请求里含"加载模型"，读超时得放宽 —— 见模块开头的要点 4。
         self._warm_model = None
         self.last_load_ms = None  # 最近一次 preload 花了多久（界面"测试连接"要分开报）
+        # 复用的连接池（见 _request）。**名字不能叫 `_session`**：那会和下面的
+        # `_session()` 方法撞名，实例属性一覆盖，`self._session()` 就变成
+        # `None(...)` → "NoneType object is not callable"（本机实测踩过一次）。
+        self._http_session = None
+
+    # ---------------------------------------------------------------- HTTP
+
+    def _session(self):
+        """复用一个 `requests.Session`：省掉连接 churn
+
+        前缀翻译每 `simul_prefix_interval_ms`（默认 800ms）一条，一句带 N 个术语要发
+        N+1 条，每条都新建 TCP 连接纯属白花时间。惰性创建：不翻译的会话根本不建。
+        """
+        if self._http_session is None:
+            self._http_session = requests.Session()
+        return self._http_session
+
+    def _drop_session(self):
+        session, self._http_session = self._http_session, None
+        if session is not None:
+            try:
+                session.close()
+            except Exception:
+                pass
+
+    def _request(self, method, url, **kwargs):
+        """走连接池发一次请求
+
+        **超时不重试**：一次读超时本身就是结论（冷加载慢 / 模型又被卸了），
+        `_translate_one` 靠它决定要不要清 `_warm_model`；重试等于把 120 秒翻倍。
+        只对"连接层面的错"重连一次 —— 连接池里那条空闲连接被服务端关了（Ollama
+        空闲一会儿就会关）属于常态，丢掉换一条就行。
+        """
+        try:
+            return self._session().request(method, url, **kwargs)
+        except requests.exceptions.Timeout:
+            raise
+        except requests.exceptions.RequestException:
+            self._drop_session()
+            return self._session().request(method, url, **kwargs)
+
+    def close(self):
+        """放掉这个客户端（当前只有连接池）。幂等。"""
+        self._drop_session()
+
+    def forget_warm(self):
+        """忘掉"哪个模型已经热过"（换了服务地址 / 接口类型时调）
+
+        `_warm_model` 记的是"这个模型在显存里"，换服务之后新服务上什么都没有，而它还
+        记着旧的 —— 下一次请求会按热模型的 `local_llm_timeout_ms`（3 秒）发出去，实际
+        却要冷加载，必然超时回落成原文。换个服务地址还要"等它自己撞一次超时"太蠢了。
+        """
+        self._warm_model = None
 
     # ---------------------------------------------------------------- 探活
 
@@ -185,7 +252,7 @@ class LocalLLMTranslator:
         url = self._url()
         path = "/v1/models" if self._api_style() == "openai" else "/api/tags"
         try:
-            resp = requests.get(url + path, timeout=2)
+            resp = self._request("GET", url + path, timeout=2)
         except Exception as e:
             self.last_error = "连不上 %s：%s" % (url, e)
             return None
@@ -247,6 +314,11 @@ class LocalLLMTranslator:
         if not model:
             self.last_error = "没有配置本地模型名"
             return False, self.last_error
+        # 要加载的新模型进来之前先清个场：免得刚加载好又被 Ollama 挤掉（见模块开头要点 6）。
+        # 放在这里是因为界面上所有"主动加载"的路都经过本方法（`local_health()` → `self_test()`
+        # → here），也就是"测试连接"和"切完模型点测试"这两条 —— 正是多模型同驻的源头。
+        if config.get("unload_previous_llm_on_switch", True):
+            self.unload_others(keep=[model])
         if self._api_style() == "openai":
             body = {"model": model, "stream": False, "temperature": 0.0,
                     "max_tokens": 1, "messages": [{"role": "user", "content": "."}]}
@@ -257,7 +329,7 @@ class LocalLLMTranslator:
                     "messages": [{"role": "user", "content": "."}]}
         started = time.time()
         try:
-            resp = requests.post(self._url() + self._chat_path(), json=body,
+            resp = self._request("POST", self._url() + self._chat_path(), json=body,
                                  timeout=(2, _LOAD_READ_TIMEOUT_S))
         except Exception as e:
             self.last_error = "加载模型失败（预热请求没回来）：%s" % e
@@ -296,6 +368,111 @@ class LocalLLMTranslator:
         if self.last_stats.get("tok_per_s"):
             parts.append("%.1f tok/s" % self.last_stats["tok_per_s"])
         return True, "正常：%s" % "，".join(parts)
+
+    # ---------------------------------------------------------------- 卸载/驻留
+
+    def unload(self, model=None):
+        """让服务把某个模型从显存里卸掉（不给就卸配置里那一个）。返回是否成功。
+
+        做法照抄 `check_local_translate.py` 里已经实测过的那条路：给 `/api/generate`
+        发一个 `keep_alive: 0` 的空请求，Ollama 收到就立刻放掉这个模型。
+
+        和诊断脚本刻意不同的两点：
+        - **不在生产代码里轮询 `/api/ps` 确认**：那是给检查脚本用的，界面线程上跑要白等
+          好几秒；"到底卸掉没有"交给 `check_gpu_reclaim.py` 去验。
+        - **卸掉当前模型时必须清 `_warm_model`**（模块开头要点 6）：否则下一次翻译仍按
+          "热模型"用 `local_llm_timeout_ms`（3 秒）发请求，而它其实要冷加载（1.7B-Q8 实测
+          1.4 秒、9B 10.8 秒）→ 必然 ReadTimeout → 第 5 步回落成原文上屏。
+
+        OpenAI 兼容接口（llama-server）没有通用的卸载通路，返回 False 并说明。
+        """
+        if self._api_style() == "openai":
+            self.last_error = "OpenAI 兼容接口（llama-server）没有卸载通路，要回收请重启服务"
+            return False
+        model = str(model or self._model() or "").strip()
+        if not model:
+            self.last_error = "没有配置本地模型名"
+            return False
+        url = self._url()
+        try:
+            # model 必须点名，不能省；空 prompt 的那条路上游会当成"只加载/只卸载"
+            resp = self._request("POST", url + "/api/generate",
+                                 json={"model": model, "keep_alive": 0},
+                                 timeout=(2, _UNLOAD_TIMEOUT_S))
+        except Exception as e:
+            self.last_error = "卸载模型失败（连不上 %s）：%s" % (url, e)
+            return False
+        if resp.status_code != 200:
+            self.last_error = "卸载模型返回 HTTP %s：%s" % (resp.status_code, resp.text[:200])
+            return False
+        if self._warm_model == model:
+            self._warm_model = None
+        self.last_error = None
+        return True
+
+    def resident_models(self):
+        """现在显存里有哪些模型：`[(名字, 显存 MiB, 到期时刻), …]`；**连不上返回 None**
+
+        Ollama 的 `/api/ps` 实测（0.40.2）返回 `name/size/size_vram/expires_at/
+        context_length/runner`，这里只取界面要用的三样。OpenAI 兼容接口没有这个
+        通路，返回空列表（表示"问不出来"，不是"一个都没有"）。
+        """
+        if self._api_style() == "openai":
+            return []
+        url = self._url()
+        try:
+            resp = self._request("GET", url + "/api/ps", timeout=2)
+        except Exception as e:
+            self.last_error = "连不上 %s：%s" % (url, e)
+            return None
+        if resp.status_code != 200:
+            self.last_error = "/api/ps 返回 HTTP %s" % resp.status_code
+            return None
+        try:
+            data = resp.json()
+        except Exception as e:
+            self.last_error = "返回内容不是 JSON：%s" % e
+            return None
+        items = data.get("models") if isinstance(data, dict) else data
+        result = []
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name") or item.get("model")
+            if not name:
+                continue
+            size = item.get("size_vram") or item.get("size") or 0
+            try:
+                size_mib = int(size) // (1024 * 1024)
+            except (TypeError, ValueError):
+                size_mib = 0
+            result.append((name, size_mib, item.get("expires_at")))
+        self.last_error = None
+        return result
+
+    def unload_others(self, keep=None):
+        """卸掉除 `keep` 之外所有驻留的模型，返回卸掉的数量
+
+        8 GB 卡上"EuroLLM(1.73GB) + Spark(3.52GB) 同时驻留"就是这么来的（本机实测）。
+        白占显存只是其一：Ollama 会为了给新模型腾地方把**正在用的**那个挤掉重载，
+        界面上看着就是"某些句子突然回落成原文"。所以切模型前先清场。
+
+        `keep` 是模型名（字符串或列表）；配置里当前在用的那个永远保留。连不上服务
+        或压根没有多余模型时返回 0，不抛异常。
+        """
+        keep = set([keep] if isinstance(keep, str) else (keep or []))
+        keep.discard("")
+        keep.add(self._model())
+        resident = self.resident_models()
+        if not resident:
+            return 0
+        count = 0
+        for name, _size_mib, _expires in resident:
+            if name in keep:
+                continue
+            if self.unload(name):
+                count += 1
+        return count
 
     # ---------------------------------------------------------------- 翻译
 
@@ -347,7 +524,7 @@ class LocalLLMTranslator:
         started = time.time()
         try:
             # (连接超时, 读取超时)：本机服务连接是瞬时的，超时基本都发生在生成上
-            resp = requests.post(url, json=payload, timeout=(2, read_timeout))
+            resp = self._request("POST", url, json=payload, timeout=(2, read_timeout))
         except Exception as e:
             self.last_error = self._request_error(e, cold, timeout_ms)
             if not cold and isinstance(e, requests.exceptions.Timeout):

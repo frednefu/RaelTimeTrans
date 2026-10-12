@@ -19,12 +19,14 @@
 """
 import os
 import shutil
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")  # 必须赶在导入 PySide6 之前
 
-from PySide6.QtWidgets import QApplication, QGroupBox, QScrollArea  # noqa: E402
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel, QScrollArea  # noqa: E402
 
 from config import config  # noqa: E402
+from model_residency import model_residency  # noqa: E402
 
 FAILED = []
 
@@ -125,10 +127,44 @@ def main():
         app.processEvents()
         check(window.local_llm_box.isHidden() and window.local_advanced_box.isHidden(),
               "切到 Google：本地模型那几行和服务地址那几行一起收起")
+        # 「显存」那一行**不在 local_llm_box 里**：它报的是整台机器的驻留情况
+        # （识别模型才是大头的占位者），换翻译引擎不该把它藏起来。
+        check(not window.residency_label.isHidden() and not window.release_gpu_button.isHidden(),
+              "切到 Google：显存状态行和「释放显存」按钮照样在")
         window.translation_backend_combo.setCurrentText("本地模型（低延迟）")
         app.processEvents()
         check(not window.local_llm_box.isHidden() and not window.local_advanced_box.isHidden(),
               "切回本地：两块都回来")
+
+        print("— 显存回收的控件 —")
+        check(window.advanced_group.isChecked() or window.local_advanced_box.isHidden()
+              or window.idle_unload_spin is not None,
+              "「闲置卸载」旋钮挂在本地模型的高级那一块里")
+        check(window.idle_unload_spin.value() == int(config.get("model_idle_unload_sec", 300)),
+              f"闲置卸载秒数来自配置（{window.idle_unload_spin.value()}）")
+        check(window.model_idle_unload_checkbox.isChecked()
+              == bool(config.get("model_idle_unload_enabled", True)),
+              "「自动回收」勾选状态来自配置")
+        # 标题（"显存:"）和正文是两个部件：正文里没有"显存"二字，别按正文找标题
+        captions = [label.text() for label in window.findChildren(QLabel)
+                    if label.text().startswith("显存")]
+        check(captions == ["显存:"], "「显存」那一行有标题（%s）" % (captions or "没有"))
+        text = window.residency_label.text()
+        check("torch" in text or "驻留" in text or "已卸载" in text,
+              "显存状态行的正文报的是用量/驻留情况（现在是 %r）" % text)
+        # 关掉自动回收 = 三项闲置超时都设 0（只认手动点按钮）
+        window.model_idle_unload_checkbox.setChecked(False)
+        app.processEvents()
+        timeouts = {e["key"]: e["idle_timeout"] for e in model_residency.snapshot()}
+        check(timeouts and all(value == 0 for value in timeouts.values()),
+              f"关掉「自动回收」之后账本上不再按闲置卸（{timeouts}）")
+        check(config.get("model_idle_unload_enabled") is False,
+              "这个开关立刻落了盘")
+        window.model_idle_unload_checkbox.setChecked(True)
+        app.processEvents()
+        timeouts = {e["key"]: e["idle_timeout"] for e in model_residency.snapshot()}
+        check(all(value == window.idle_unload_spin.value() for value in timeouts.values()),
+              f"勾回来之后三项都按旋钮的值走（{timeouts}）")
 
         print("— 预览区还在（设置里换字号要能找到它）—")
         preview_layout = window.findChild(QGroupBox, "字幕预览")

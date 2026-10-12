@@ -10,14 +10,18 @@ import pyaudio
 from pydub import AudioSegment
 from collections import deque, namedtuple
 import logging
+from logging.handlers import RotatingFileHandler
 from translation.subtitle_file_manager import SubtitleFileManager
 import torch
 from audio.audio_processor import AudioProcessor
 from audio.audio_timeline import TimedWord, WordSegment, AudioSegmentTask
 from config import config  # 添加 config 导入
+from model_residency import model_residency, free_cuda_cache
 
-# 添加UI线程分离的队列
-ui_update_queue = queue.Queue()
+# 添加UI线程分离的队列。
+# **有界**：这个队列只有 put 没有消费者（旧接口留下的），无界的话跑几个小时就是
+# 一条只涨不缩的内存；满了直接丢最旧的，反正没人读。
+ui_update_queue = queue.Queue(maxsize=64)
 
 # 调试开关，控制是否输出调试信息到控制台
 DEBUG_MODE = True
@@ -26,9 +30,25 @@ DEBUG_MODE = True
 logger = logging.getLogger('whisper_model')
 logger.setLevel(logging.INFO)
 
-# 创建文件处理器
-file_handler = logging.FileHandler('whisper_model.log', mode='a', encoding='utf-8')
+# 创建文件处理器。
+# 带轮转：这个日志是每次识别的明细，跑一天能到几十 MB，无界增长没必要。
+# 超过 5 MB 就改名成 whisper_model.log.1 重开一个（只留一代，够查最近的问题）。
+file_handler = RotatingFileHandler('whisper_model.log', mode='a', encoding='utf-8',
+                                   maxBytes=5 * 1024 * 1024, backupCount=1)
 file_handler.setLevel(logging.INFO)
+
+
+def _ui_update_queue_put(item):
+    """往 `ui_update_queue` 放东西（满了就丢最旧的，绝不阻塞工作线程）"""
+    try:
+        ui_update_queue.put_nowait(item)
+    except queue.Full:
+        try:
+            ui_update_queue.get_nowait()      # 腾一格
+            ui_update_queue.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            pass
+
 
 # 创建格式化器
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -176,6 +196,7 @@ class AudioManager:
         self.recognition_thread = None
         self.playback_thread = None  # 新增：专门用于音频播放的线程
         self.stream = None
+        self.output_stream = None        # 监听时的播放流（_playback_audio 里赋值）
         self.pyaudio_instance = None
         self.detected_language = None  # 存储检测到的语言
         # 语种检测是逐段做的，单段音频（1~7 秒）偶尔会判错，界面上就会看到
@@ -223,13 +244,37 @@ class AudioManager:
         self.asr_backend = config.get("asr_backend", "whisper_batch")
         self.stream_engine = None        # SimulStreamingEngine（未启用时 None）
         self.stream_thread = None
-        self.stream_queue = queue.Queue()
+        # 当前这一轮的队列。**每轮一个全新对象**（见 _prepare_streaming）：
+        # 上一轮的线程捕获的是上一轮那个队列，永远不会读到新一轮的事件。
+        self.stream_queue = None
+        # 当前这一轮的停止信号。流式线程的退出条件不能只看队列里的 "stop" 事件
+        # （事件可能进不来，而 warmup 期间线程根本不看队列），所以另配一个 Event。
+        self._stream_stop_event = None
+        # 轮次令牌：旧线程靠它认出"我已经不是当前这一轮了"，直接退场，不再碰共享状态。
+        self._stream_round = 0
+        # 上一轮线程没收干净（join 超时）时置 True → 下一轮不复用引擎，重建。
+        self._stream_engine_dirty = False
+        # 交接中的旧引擎：线程已经退出、但还没卸，等新一轮的流式线程先卸它再热新模型
+        # （保证显卡上任何时刻只有一份 whisper）。
+        self._retired_stream_engine = None
         # "starting"（正在加载模型）/"ready"/"failed"（起不来，退回整句识别）
         self._stream_state = "starting"
         # 最近一次已确认前缀：(utterance_id, 文本)，界面轮询拿去翻译
         self._committed_prefix = (None, "")
         self._committed_lock = threading.Lock()
         self.stream_error = None         # 流式不可用的原因（界面要显示）
+
+        # 把两个识别模型都登记进显存协调器：闲置超时、点「释放显存」、切后端时
+        # 由它统一决定放谁。release_fn 一律是"查当前状态"的绑定方法，绝不捕获
+        # 具体的引擎对象——引擎会按参数签名重建。
+        model_residency.register(
+            "asr_simul", "流式识别", self._release_stream_engine, kind="asr",
+            idle_timeout=None,      # 超时值由 MainWindow 按配置设（见 _sweep_residency）
+            guard_fn=lambda: not self.is_running)
+        model_residency.register(
+            "asr_batch", "整句识别", self._release_batch_model, kind="asr",
+            idle_timeout=None,
+            guard_fn=lambda: not self.is_running)
 
 
         # 从配置文件读取模型设置
@@ -519,6 +564,10 @@ class AudioManager:
         # 流式识别：后端在"开始翻译"时定下来（运行中改设置要重开才生效）
         self.asr_backend = config.get("asr_backend", "whisper_batch")
         self._prepare_streaming()
+        # 腾显存：这一轮只留"一个识别 + 一个翻译模型"。另一个后端那个 whisper
+        # （上一轮保留下来的）在这里放掉——8 GB 卡上没必要养两份识别模型。
+        # 放在 _prepare_streaming 之后：那时上一轮线程已经收干净，不会抽走它正在用的模型。
+        self._release_stale_models()
 
         # 提取设备索引（按名字重新匹配，不信任标签里的旧索引）
         try:
@@ -758,12 +807,18 @@ class AudioManager:
 
         # 流式识别线程：让它把手上这句话定稿（不定稿最后一句会丢），再等它退出
         self._stop_streaming()
-        if self.stream_thread and self.stream_thread.is_alive():
+        thread = self.stream_thread
+        if thread and thread.is_alive():
             try:
-                self.stream_thread.join(timeout=2)
+                thread.join(timeout=3)
             except Exception as e:
                 print(f"等待流式识别线程结束时出错: {str(e)}")
-        
+            if thread.is_alive():
+                # 没退干净：本轮引擎不能复用（它可能还在被那个线程用），标脏让
+                # 下一轮重建。线程自己会在 finally 里把手上的引擎卸掉。
+                self._stream_engine_dirty = True
+                print("流式识别线程未在 3 秒内结束，下一轮将重建引擎")
+
         # 确保音频处理器的线程池停止
         if hasattr(self.audio_processor, 'thread_pool'):
             try:
@@ -771,7 +826,7 @@ class AudioManager:
                 print("Whisper线程池已停止")
             except Exception as e:
                 print(f"停止Whisper线程池时出错: {str(e)}")
-        
+
         # 清理资源
         self._cleanup_pyaudio()
 
@@ -780,6 +835,12 @@ class AudioManager:
         self._input_volume_time = 0.0
         self.output_volume = 0.0
         self._output_volume_time = 0.0
+
+        # 识别模型**故意不卸**：留着给下一次"开始翻译"复用（省掉 2.5 秒加载 +
+        # 1.4 GB 重载）。这里只是把闲置计时归零——闲置超过 model_idle_unload_asr_sec
+        # 秒之后，界面那个定时器会调协调器把它卸掉；点「释放显存」也能立刻卸。
+        self.touch_asr()
+        model_residency.touch("llm")     # 翻译模型同理：停止即起算闲置
 
         print("录音和识别已完全停止")
             
@@ -887,6 +948,10 @@ class AudioManager:
 
             # 流式识别：刚检测到语音起点，等这一块进了缓冲区再开喂（见下面那段）
             stream_begin_pending = False
+            # 这一轮要投的队列**在这里捕获一次**，之后所有事件都用它。不每帧去读
+            # `self.stream_queue`：万一上一轮的录音线程残留了一小会儿，它手上是它
+            # 那一轮的队列，污染不到新一轮。
+            stream_q = self.stream_queue
 
             # 静音检测参数
             silence_frames = 0
@@ -1008,12 +1073,13 @@ class AudioManager:
                             start_index = max(
                                 0, len(recognition_buffer) - 1 - _STREAM_PREROLL_CHUNKS)
                             self._stream_begin(
+                                stream_q,
                                 utterance_id,
                                 (buffer_start_chunk + start_index)
                                 * self.chunk_size / self.sample_rate,
                                 recognition_buffer[start_index:])
                         else:
-                            self._stream_chunk(audio_float)
+                            self._stream_chunk(stream_q, audio_float)
 
                     # ── 预览识别：说话过程中先看个大概 ────────────────────────
                     # 整句识别要等 0.5 秒静音才提交，等结果回来这句话早播完了，
@@ -1084,7 +1150,7 @@ class AudioManager:
                             if speech_detected:
                                 print(f"流式识别：第{utterance_id}句结束"
                                       f"（{recognition_buffer_duration:.2f}秒），提交定稿")
-                                self._stream_end(utterance_id)
+                                self._stream_end(stream_q, utterance_id)
                             else:
                                 # 一句话说完之后一直没人说话，缓冲区单靠静音攒到了
                                 # max_utterance_sec：这一轮没有语音起点，引擎那边
@@ -1214,6 +1280,11 @@ class AudioManager:
                     frames_per_buffer=self.chunk_size,
                     output_device_index=self.output_device_index if hasattr(self, 'output_device_index') else None
                 )
+                # 存到实例上：`_cleanup_pyaudio` 是靠 `self.output_stream` 关它的。
+                # 以前这里是个局部变量，那个字段从头到尾没人赋值，于是 `_cleanup_pyaudio`
+                # 里的 `hasattr` 永远为假——输出流只能等 PyAudio 实例被 terminate 时
+                # 连带收掉，监听反复开关时容易漏。
+                self.output_stream = output_stream
 
                 # 记下真正打开的设备名，界面上直接显示，避免"以为在放耳机其实在放显示器"
                 self.monitor_device_index = self.output_device_index
@@ -1270,7 +1341,8 @@ class AudioManager:
             import traceback
             traceback.print_exc()
         finally:
-            # 关闭输出流
+            # 关闭输出流，并把实例上那个引用一起清掉（否则 `_cleanup_pyaudio` 会去关
+            # 一个已经关过的流）
             if 'output_stream' in locals() and output_stream:
                 try:
                     if output_stream.is_active():
@@ -1278,6 +1350,9 @@ class AudioManager:
                     output_stream.close()
                 except Exception as e:
                     print(f"关闭音频输出流时出错: {str(e)}")
+                finally:
+                    if self.output_stream is output_stream:
+                        self.output_stream = None
 
             # 线程结束（停止翻译或单独关掉监听）后音量表归零
             self.output_volume = 0.0
@@ -1346,33 +1421,57 @@ class AudioManager:
     # 一个提交间隔就给出"已确认前缀"，句尾再定稿。原理与实测数据见
     # audio/simul_asr.py 的文件头。
 
-    def _stream_live(self):
-        """现在是否还在走流式识别（引擎没起来或崩了就是 False，退回整句识别）"""
-        return self.stream_engine is not None and self._stream_state != "failed"
+    def _release_stale_models(self):
+        """放掉这一轮用不到的那个识别模型（保留本轮的识别模型 + 本地翻译模型）
 
-    def _prepare_streaming(self):
-        """按 asr_backend 准备识别通路（start_recording 里调一次）
+        `force=True` 是必须的：协调器的 guard 是"正在识别时不许卸"，而这里
+        `is_running` 已经置 True 了（录音线程还没起来）。此刻安全——要放掉的那个
+        不是本轮在用的（本轮引擎刚在 `_prepare_streaming` 里定下来）。
 
-        引擎在流式线程里加载（本机约 3 秒），**不能放在这里**：start_recording 是
-        界面线程调的，卡三秒就是"点了开始翻译窗口不动"。加载期间录音线程照常把
-        音频喂进队列排着，加载完按顺序处理，一句话都不会丢。
+        翻译模型不在这里放：它一个就 1.7 GB，和 whisper small 同驻完全撑得住，
+        放掉反而让下一句要等冷加载（第一次翻译特别慢的老毛病）。
         """
-        self._clear_committed_prefix()
-        self.stream_error = None
-        while True:
-            try:
-                self.stream_queue.get_nowait()
-            except queue.Empty:
-                break
+        keep = {"llm"}
+        keep.add("asr_simul" if self.asr_backend == "simul" else "asr_batch")
+        freed = model_residency.release_others(keep=keep, force=True)
+        if freed:
+            print(f"显存回收：为本次识别腾地方，释放了 {freed} 个用不到的模型")
 
-        if self.asr_backend != "simul":
-            self.stream_engine = None
-            self.stream_thread = None
-            self._stream_state = "off"
-            return
+    def _stream_live(self):
+        """现在是否还在走流式识别（引擎没起来或崩了就是 False，退回整句识别）
 
+        **后端那一条是必须的**：引擎为了复用会跨轮保活（停止时不卸），于是切回
+        整句后端之后 `stream_engine` 仍然不是 None。少了这个判断，整句通路会误以为
+        流式还活着——"整句后端行为逐字节不变"的约定就破了。加上之后，整句后端下
+        返回值与改造前**完全一致**（那时 stream_engine 本来就是 None，判出来也是 False）。
+        """
+        return (self.asr_backend == "simul"
+                and self.stream_engine is not None
+                and self._stream_state != "failed")
+
+    def _stream_signature(self):
+        """当前配置下流式引擎的签名（决定能不能复用上一轮那个引擎）
+
+        必须和 `SimulStreamingEngine.signature` 一一对应：**任何会让解码行为改变的
+        配置项都要在这里**，否则改了设置还以为生效了。
+        """
+        return (str(config.get("simul_model", "small")),
+                int(config.get("simul_frame_threshold", 12)),
+                int(config.get("simul_commit_interval_ms", 800)),
+                int(config.get("simul_min_chunk_ms", 600)),
+                config.get("source_language", "auto"),
+                float(config.get("simul_max_utterance_sec", 25)) + 5.0,
+                bool(config.get("simul_never_fire", False)),
+                int(config.get("simul_max_context_tokens", 0)) or None)
+
+    def _new_stream_engine(self):
+        """按当前配置建一个引擎对象
+
+        注意：**这里不加载模型**（加载是 `warmup()` 的事，在流式线程里做），所以
+        这一步很便宜，放在界面线程也没有卡顿。
+        """
         from audio.simul_asr import SimulStreamingEngine
-        self.stream_engine = SimulStreamingEngine(
+        return SimulStreamingEngine(
             model=config.get("simul_model", "small"),
             frame_threshold=config.get("simul_frame_threshold", 12),
             commit_interval_ms=config.get("simul_commit_interval_ms", 800),
@@ -1383,120 +1482,292 @@ class AudioManager:
             never_fire=config.get("simul_never_fire", False),
             max_context_tokens=config.get("simul_max_context_tokens", 0),
         )
+
+    def _prepare_streaming(self):
+        """按 asr_backend 准备识别通路（start_recording 里调一次）
+
+        引擎在流式线程里加载（本机约 3 秒），**不能放在这里**：start_recording 是
+        界面线程调的，卡三秒就是"点了开始翻译窗口不动"。加载期间录音线程照常把
+        音频喂进队列排着，加载完按顺序处理，一句话都不会丢。
+
+        三件事按顺序做，缺一样都会出问题：
+
+        1. **先收掉上一轮**（投 stop + set Event + join）。原来是"清空队列"了事，
+           结果把上一轮还没被消费的 `"stop"` 一起吞了——旧线程永不退出，抱着旧引擎
+           占着显存，还抢同一个队列的事件，屏幕上是乱句/重复/丢句。现在**不清队列**，
+           而是把队列换成新的（见第 3 步）。
+        2. **决定复用还是重建**：签名一致就复用（省掉 2.5 秒加载 + 1.4 GB 重载），
+           不一致先卸旧的再建新的。旧引擎交给流式线程卸——**卸载和解码都在同一条
+           线程上排队，显卡上任何时刻只有一份 whisper**，不会有两份撞在一起 OOM。
+        3. **每轮一个全新的队列 + 全新的停止 Event + 递增的轮次号**，并把它们当参数
+           传给线程。旧线程捕获的是旧队列和旧轮次号，天然读不到新一轮的事件。
+        """
+        self._clear_committed_prefix()
+        self.stream_error = None
+
+        # 1. 收掉上一轮
+        self._signal_stream_stop()
+        thread = self.stream_thread
+        exited = True
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=3)
+            exited = not thread.is_alive()
+            if not exited:
+                # 还没退（多半是 warmup 卡在加载里）。不让它拖住新一轮：
+                # 标记脏，本轮不复用这个引擎，重建一个干净的。
+                self._stream_engine_dirty = True
+                print("上一轮流式识别线程未在 3 秒内退出，本轮将重建引擎")
+
+        if self.asr_backend != "simul":
+            # 引擎保活：这里**不**卸载。整句后端下它只是闲置，由协调器的闲置回收
+            # 或「释放显存」按钮处理（`_stream_live` 有后端守卫，不会误用）。
+            self.stream_thread = None
+            self.stream_queue = None
+            self._stream_stop_event = None
+            self._stream_state = "off"
+            return
+
+        # 2. 复用还是重建
+        reused = (self.stream_engine is not None
+                  and not self._stream_engine_dirty
+                  and self._stream_state != "failed"
+                  and self.stream_engine.signature == self._stream_signature())
+        retired = None
+        if reused:
+            print("流式识别：复用上一轮的引擎（不重新加载模型）")
+            self.stream_engine.reset_session()
+        else:
+            # 旧引擎的所有权交接，规则只有一条：**谁在用，谁负责卸**。
+            # 线程已经退出了 → 它不用了，交给新线程在热新模型之前首尾相接地卸掉
+            #                    （保证显卡上任何时刻只有一份 whisper）；
+            # 线程还活着 → 引擎还在它手上，让它自己在 finally 里卸（见 _stream_recognize），
+            #              这里碰它会把它正在用的模型抽走。
+            if exited and self.stream_engine is not None:
+                retired = self.stream_engine
+                # 兜底：更早那一轮留下的、一直没人卸的那个（线程异常退出）
+                stale = getattr(self, "_retired_stream_engine", None)
+                if stale is not None and stale is not retired:
+                    stale.unload()
+                self._retired_stream_engine = retired
+            self.stream_engine = self._new_stream_engine()
+
+        # 3. 新一轮的队列/信号/轮次
+        self._stream_engine_dirty = False
+        self.stream_queue = queue.Queue()
+        self._stream_stop_event = threading.Event()
+        self._stream_round += 1
         self._stream_state = "starting"
         self.stream_thread = threading.Thread(
-            target=self._stream_recognize, name="audio-stream-recognize", daemon=True)
+            target=self._stream_recognize,
+            args=(self.stream_engine, self.stream_queue, self._stream_stop_event,
+                  self._stream_round, retired),
+            name="audio-stream-recognize", daemon=True)
         self.stream_thread.start()
 
-    def _stop_streaming(self):
-        """让流式线程把手上这句话定稿后退出（"stop"是它唯一的退出信号）
+    def _signal_stream_stop(self):
+        """叫停流式线程：先投 "stop"（让它把最后一句定稿），再 set Event 兜底
 
-        退出信号不能是"队列空了"，否则线程可能在收尾事件入队之前就抢跑退出，
-        最后那句话的终稿就丢了。
+        两个信号是有分工的：`"stop"` 事件走正常通道，线程收到后定稿再退；Event 是
+        硬信号，兜住"事件根本进不来"的情况（warmup 期间线程压根不看队列）。只 set
+        Event 不定稿的话，最后那句话的终稿就丢了，所以两个都要。
         """
-        if self.stream_engine is None:
+        event = self._stream_stop_event
+        if event is not None:
+            event.set()
+        q = self.stream_queue
+        if q is not None:
+            try:
+                q.put(_StreamEvent("stop", None, 0.0, None))
+            except Exception as e:
+                print(f"通知流式识别线程退出失败: {str(e)}")
+
+    def _stop_streaming(self):
+        """停止时叫停流式线程（`stop_recording` 里调）"""
+        if self.stream_engine is None and self.stream_thread is None:
+            return
+        self._signal_stream_stop()
+
+    def _stream_begin(self, q, utterance_id, offset_sec, blocks):
+        """新的一句话开始：告诉引擎这句话的起点，并把开头这几块音频一起喂进去
+
+        队列是**显式传进来的**（录音线程在进入帧循环时捕获一次），不再读
+        `self.stream_queue`：万一上一轮的录音线程残留了一小会儿，它只会往自己那一轮
+        的队列里投，污染不到新一轮。
+        """
+        if q is None:
             return
         try:
-            self.stream_queue.put(_StreamEvent("stop", None, 0.0, None))
-        except Exception as e:
-            print(f"通知流式识别线程退出失败: {str(e)}")
-
-    def _stream_begin(self, utterance_id, offset_sec, blocks):
-        """新的一句话开始：告诉引擎这句话的起点，并把开头这几块音频一起喂进去"""
-        try:
-            self.stream_queue.put(_StreamEvent("begin", utterance_id, offset_sec,
-                                               list(blocks)))
+            q.put(_StreamEvent("begin", utterance_id, offset_sec, list(blocks)))
         except Exception as e:
             print(f"流式识别开始新句失败: {str(e)}")
 
-    def _stream_chunk(self, block):
+    def _stream_chunk(self, q, block):
         """喂一块音频给流式引擎"""
+        if q is None:
+            return
         try:
-            self.stream_queue.put(_StreamEvent("chunk", None, 0.0, block))
+            q.put(_StreamEvent("chunk", None, 0.0, block))
         except Exception as e:
             print(f"流式识别喂音频失败: {str(e)}")
 
-    def _stream_end(self, utterance_id):
+    def _stream_end(self, q, utterance_id):
         """这句话说完了：让引擎定稿（终稿走整句识别那条出口）"""
+        if q is None:
+            return
         try:
-            self.stream_queue.put(_StreamEvent("end", utterance_id, 0.0, None))
+            q.put(_StreamEvent("end", utterance_id, 0.0, None))
         except Exception as e:
             print(f"流式识别收尾失败: {str(e)}")
 
-    def _stream_recognize(self):
+    # ── 显存回收：登记给 model_residency 的两个回调 ──────────────────────
+
+    def _release_stream_engine(self):
+        """把流式引擎和它的显存放掉（协调器的 release_fn）
+
+        幂等：没引擎、已经卸过都能调。**必须查当前状态**，不能捕获某个引擎对象——
+        引擎会按参数签名重建。
+        """
+        engine, self.stream_engine = self.stream_engine, None
+        if engine is not None:
+            engine.unload()
+        self._retired_stream_engine = None
+        self._stream_state = "off"
+        free_cuda_cache()
+        print("显存回收：流式识别模型已卸载")
+
+    def _release_batch_model(self):
+        """把整句识别模型放掉（协调器的 release_fn）
+
+        整句模型原来只在关窗口时释放（`closeEvent` → `cleanup()`）。抽出来单独一个
+        方法是为了让它也能被闲置回收和「释放显存」按钮管到。
+        """
+        try:
+            self.audio_processor.release_model()
+        except Exception as e:
+            print(f"释放整句识别模型失败：{e}")
+
+    def touch_asr(self):
+        """告诉协调器"识别刚用过"（闲置计时从这个点起算）"""
+        key = "asr_simul" if self.asr_backend == "simul" else "asr_batch"
+        model_residency.touch(key)
+
+    def _stream_recognize(self, engine, q, stop_event, round_id, retired=None):
         """流式识别线程：加载引擎 → 按事件顺序喂音频/提交/定稿
+
+        参数都是**当轮**的（不是从 `self` 现读的）：队列、停止信号、轮次号、以及
+        需要首尾相接地卸掉的上一轮引擎。这是"旧线程只认自己那一轮"的实现方式——
+        即使它还赖着没退，也读不到新一轮的事件、改不了新一轮的状态。
 
         只有它碰引擎，所以引擎内部不需要加锁。整句识别那条路（audio_queue、
         线程池）在流式模式下全程空转；一旦这里报错，就把 _stream_state 置成
         "failed"，录音线程下一块音频开始改走整句识别。
         """
-        engine = self.stream_engine
-        print("流式识别线程已启动，正在加载模型（这期间采集的音频会排队等着）...")
-        if engine is None or not engine.warmup():
-            self.stream_error = (engine.last_error if engine else None) or "引擎创建失败"
-            self._stream_state = "failed"
-            print(f"流式识别起不来，本次运行自动退回整句识别：{self.stream_error}")
-            return
+        # 先卸上一轮（如果有）：**必须在预热新模型之前**，这样显卡上任何时刻
+        # 只有一份 whisper。放在这里而不是界面线程，是因为 unload() 里的
+        # empty_cache() 会阻塞一会儿，界面上会卡顿。
+        if retired is not None:
+            print("流式识别：先卸掉上一轮的模型，再热新的")
+            retired.unload()
 
-        self._stream_state = "ready"
-        print(f"流式识别就绪: 模型={engine.model_name}, 加载={engine.load_ms}ms, "
-              f"预热={engine.warmup_ms}ms, 提交间隔={engine.commit_interval_ms}ms, "
-              f"注意力阈值={engine.frame_threshold}帧, 语种={engine.language}")
+        def current():
+            """我还是当前这一轮吗（不是了就别再碰共享状态）"""
+            return round_id == self._stream_round
 
-        started = False            # 当前这句话引擎已经在跟了吗
-        utterance = None           # 当前这句话的编号
-        failures = 0               # 连续失败次数（连着三次说明引擎废了）
-
-        while True:
-            try:
-                event = self.stream_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            if event.kind == "stop":
-                if started:
-                    self._stream_finalize(engine, utterance)
-                break
-
-            try:
-                if event.kind == "begin":
-                    started = engine.begin_utterance(event.offset_sec,
-                                                     event.utterance_id)
-                    if not started:
-                        raise RuntimeError(engine.last_error or "无法开始新句")
-                    utterance = event.utterance_id
-                    for block in event.audio or ():
-                        engine.feed(block)
-                elif event.kind == "chunk":
-                    if started:
-                        engine.feed(event.audio)
-                elif event.kind == "end":
-                    if started:
-                        self._stream_finalize(engine, utterance)
-                    started = False
-                    utterance = None
-                    self._clear_committed_prefix()
-                    continue        # 刚定过稿，这一段没有待提交的东西了
-
-                if started and engine.ready_to_commit():
-                    result = engine.commit()
-                    if result:
-                        failures = 0
-                        self._publish_stream_segment(utterance, result, is_final=False)
-                    elif engine.last_error:
-                        failures += 1
-                        if failures >= 3:
-                            raise RuntimeError(engine.last_error)
-            except Exception as e:
-                self.stream_error = f"流式识别出错：{e}"
+        try:
+            print("流式识别线程已启动，正在加载模型（这期间采集的音频会排队等着）...")
+            warmed = engine.warmup()
+            if not current():
+                return
+            if stop_event.is_set():
+                # 预热期间用户点了停止。这一炮是硬信号在起作用：warmup 里不看队列，
+                # 事件进不来，只能回来之后补一刀——立刻收工，一个事件都不消费。
+                print("流式识别：预热期间已请求停止，直接结束")
+                self._stream_state = "off"
+                return
+            if not warmed:
+                self.stream_error = engine.last_error or "引擎创建失败"
                 self._stream_state = "failed"
-                self._clear_committed_prefix()
-                print(f"{self.stream_error}（本次运行退回整句识别）")
-                import traceback
-                traceback.print_exc()
+                print(f"流式识别起不来，本次运行自动退回整句识别：{self.stream_error}")
                 return
 
-        print("流式识别线程已结束")
+            self._stream_state = "ready"
+            self.touch_asr()            # 闲置计时从"就绪"这一刻起算
+            print(f"流式识别就绪: 模型={engine.model_name}, 加载={engine.load_ms}ms, "
+                  f"预热={engine.warmup_ms}ms, 提交间隔={engine.commit_interval_ms}ms, "
+                  f"注意力阈值={engine.frame_threshold}帧, 语种={engine.language}")
+
+            started = False            # 当前这句话引擎已经在跟了吗
+            utterance = None           # 当前这句话的编号
+            failures = 0               # 连续失败次数（连着三次说明引擎废了）
+
+            while not stop_event.is_set():
+                try:
+                    event = q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+
+                if not current():
+                    # 新一轮已经开始（我是被超时丢下的旧线程）：把手上的话定稿就走，
+                    # 一个共享状态都不改
+                    if started:
+                        self._stream_finalize(engine, utterance)
+                    print("流式识别：本轮已被新的一轮取代，旧线程退出")
+                    return
+
+                if event.kind == "stop":
+                    if started:
+                        self._stream_finalize(engine, utterance)
+                    break
+
+                try:
+                    if event.kind == "begin":
+                        started = engine.begin_utterance(event.offset_sec,
+                                                         event.utterance_id)
+                        if not started:
+                            raise RuntimeError(engine.last_error or "无法开始新句")
+                        utterance = event.utterance_id
+                        for block in event.audio or ():
+                            engine.feed(block)
+                    elif event.kind == "chunk":
+                        if started:
+                            engine.feed(event.audio)
+                    elif event.kind == "end":
+                        if started:
+                            self._stream_finalize(engine, utterance)
+                        started = False
+                        utterance = None
+                        self._clear_committed_prefix()
+                        self.touch_asr()
+                        continue    # 刚定过稿，这一段没有待提交的东西了
+
+                    if started and engine.ready_to_commit():
+                        result = engine.commit()
+                        if result:
+                            failures = 0
+                            self._publish_stream_segment(engine, utterance, result,
+                                                         is_final=False)
+                        elif engine.last_error:
+                            failures += 1
+                            if failures >= 3:
+                                raise RuntimeError(engine.last_error)
+                except Exception as e:
+                    self.stream_error = f"流式识别出错：{e}"
+                    if current():
+                        self._stream_state = "failed"
+                        self._clear_committed_prefix()
+                    print(f"{self.stream_error}（本次运行退回整句识别）")
+                    import traceback
+                    traceback.print_exc()
+                    return
+
+            print("流式识别线程已结束")
+        finally:
+            # 已经不是当前这一轮 → 引擎没人会再用了，自己卸掉（这就是"谁在用谁负责卸"
+            # 里"线程还活着"那一支的落地点）。是当前这一轮 → 引擎留着复用，不能卸。
+            if not current():
+                print("流式识别：旧线程退出，顺手卸掉自己那一轮的引擎")
+                engine.unload()
+                model_residency.mark_released("asr_simul")
 
     def _stream_finalize(self, engine, utterance_id):
         """句尾定稿：整句话的终稿（够长的句子才有，太短或只有噪音就什么也没有）"""
@@ -1504,7 +1775,7 @@ class AudioManager:
         if result is None:
             print(f"[流式] 第{utterance_id}句没有可用结果（太短或只有噪音）")
             return
-        self._publish_stream_segment(utterance_id, result, is_final=True)
+        self._publish_stream_segment(engine, utterance_id, result, is_final=True)
 
     def _stream_timed_words(self, words):
         """流式给的是**绝对流时间**（见 audio/simul_asr 文件头第 2 条），
@@ -1518,8 +1789,11 @@ class AudioManager:
                                    max(start, int(round(float(word.end) * scale)))))
         return timed
 
-    def _publish_stream_segment(self, utterance_id, result, is_final):
+    def _publish_stream_segment(self, engine, utterance_id, result, is_final):
         """把流式结果送出去
+
+        `engine` 显式传进来（不读 `self.stream_engine`）：出结果的是**这一轮**的引擎，
+        而 `self.stream_engine` 随时可能已经换成下一轮那个了。
 
         前缀（is_final=False）只喂逐词显示和"边说边翻译"通道；
         终稿（is_final=True）走和整句识别**完全一样**的出口：逐词、text_queue、
@@ -1529,7 +1803,7 @@ class AudioManager:
         end_chunk = max(int(round(result.end_sec * self.sample_rate / self.chunk_size)),
                         words[-1].end_chunk if words else 0)
 
-        language = getattr(self.stream_engine, "detected_language", None)
+        language = getattr(engine, "detected_language", None)
         if language and language != "unknown":
             self.detected_language = language
             self._language_votes.append(language)
@@ -1563,7 +1837,7 @@ class AudioManager:
         self.text_queue.append(text)
         # 字幕文件只认终稿
         self.subtitle_manager.add_subtitle(text)
-        ui_update_queue.put(("text_update", text))
+        _ui_update_queue_put(("text_update", text))
 
     def _set_committed_prefix(self, utterance_id, text):
         with self._committed_lock:
@@ -1588,6 +1862,10 @@ class AudioManager:
 
     def get_stream_status(self):
         """流式识别的状态文本（界面那行标签用）"""
+        if self.asr_backend != "simul":
+            # 引擎可能还在（保活着等复用），但这一轮不是流式：说清楚，别让人以为
+            # "整句识别怎么显示流式状态"。
+            return "未启用（整句识别）"
         if self.stream_engine is None:
             return "未启用（整句识别）"
         if self._stream_state == "failed":
@@ -1724,6 +2002,9 @@ class AudioManager:
                                 print(f"有效文本，准备保存结果")
                                 # 保存识别延迟
                                 self.recognition_delay = proc_time
+                                # 整句识别模型刚用过 → 重置它的闲置计时（模型可能是
+                                # 上一轮加载的，一直在显存里复用）
+                                model_residency.touch("asr_batch")
                                 
                                 # 保存识别结果 - 使用线程安全的方式
                                 try:
@@ -1750,7 +2031,7 @@ class AudioManager:
                                                   f"{len(words)}个词, 块 {seg_start}~{seg_end}")
                                     
                                     # 将UI更新任务放入UI更新队列，不直接在这里更新
-                                    ui_update_queue.put(("text_update", text))
+                                    _ui_update_queue_put(("text_update", text))
                                     
                                     # 记录日志
                                     if DEBUG_MODE:

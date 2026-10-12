@@ -597,22 +597,34 @@ class AudioProcessor:
     def __init__(self):
         self.model = None
         self.current_model_name = None
+        # 模型加载/卸载的互斥锁：`get_model()` 会被多个识别任务并发调用，而它是
+        # "先看要不要重载、再 del 旧的、再加载新的"这一串动作。没有锁的话两个任务
+        # 可能同时进到重载分支：一个刚加载好的模型被另一个 `del self.model` 掉了，
+        # 结果两个线程各拿一份、白占一份显存，或者拿到 None。
+        self._model_lock = threading.RLock()
         # 检查CUDA是否可用
         self.device = "cuda" if config.get("use_gpu", True) and torch.cuda.is_available() else "cpu"
         print(f"使用设备: {self.device}")
         if self.device == "cuda":
             # 打印GPU信息
             print(f"GPU: {torch.cuda.get_device_name(0)}")
-            
-        # 创建Whisper线程池
-        self.thread_pool = WhisperThreadPool(max_workers=2)
+
+        # 创建Whisper线程池。**1 个 worker**：整句识别本来就是"一段一段排队"，
+        # 两个 worker 只会让同一份模型被并发调用（还在 8GB 卡上争显存），
+        # 与 WhisperThreadPool 的说明（"固定为 1"）保持一致。
+        self.thread_pool = WhisperThreadPool(max_workers=1)
         
         # 确保线程池立即启动
         self.thread_pool.start()
         print("AudioProcessor初始化完成，Whisper线程池已启动")
     
     def get_model(self):
-        """获取当前配置的模型，如果需要则加载"""
+        """获取当前配置的模型，如果需要则加载（并发安全，见 `_model_lock`）"""
+        with self._model_lock:
+            return self._get_model_locked()
+
+    def _get_model_locked(self):
+        """`get_model()` 的实体（调用者必须已持有 `_model_lock`）"""
         try:
             model_name = config.get("whisper_model", "base")
             # 检查是否需要重新加载模型
@@ -918,15 +930,30 @@ class AudioProcessor:
         config.set("use_gpu", use_gpu)
         config.set("device", "cuda" if use_gpu else "cpu")
     
-    def cleanup(self):
-        """清理资源"""
-        if hasattr(self, 'thread_pool'):
-            self.thread_pool.stop()
-        # 释放模型
-        if self.model is not None:
-            del self.model
+    def release_model(self):
+        """只把模型放掉，**不动线程池**（显存回收用）
+
+        单独抽出来是因为"释放显存"和"退出程序"是两件事：闲置回收 /「释放显存」
+        按钮只想把这几 GB 还回去，线程池还得留着给下一轮识别用（`cleanup()` 那边
+        才连线程池一起停）。放掉之后 `__init__` 时那份模型没了，下一次 `get_model()`
+        会重新加载——所以调用方要清楚这一步的代价。
+
+        幂等：没加载过也能调。
+        """
+        with self._model_lock:
+            if self.model is None and self.current_model_name is None:
+                return False
             self.model = None
+            self.current_model_name = None
             import gc
             gc.collect()
-            if self.device == "cuda":
-                torch.cuda.empty_cache() 
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            print("显存回收：整句识别模型已卸载")
+            return True
+
+    def cleanup(self):
+        """清理资源（退出程序：模型和线程池一起收）"""
+        if hasattr(self, 'thread_pool'):
+            self.thread_pool.stop()
+        self.release_model()

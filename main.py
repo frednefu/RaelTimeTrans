@@ -8,9 +8,14 @@ install_safe_streams()
 
 from PySide6.QtWidgets import QApplication
 from gui.main_window import MainWindow
+from model_residency import model_residency
 
 def main():
     app = QApplication(sys.argv)
+    # 退出时兜一道：主窗口的 closeEvent 只覆盖"正常关窗"，崩溃退出、任务管理器结束、
+    # 系统注销这些路径都不经过它，而 Ollama 那边的模型会一直挂到 keep_alive 到期。
+    # 这里是"进程要走了"的最后一个通知点，放掉比不放好（失败也不抛，见 model_residency）。
+    app.aboutToQuit.connect(lambda: model_residency.release_all(force=True))
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

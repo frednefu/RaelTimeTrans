@@ -34,7 +34,9 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - 查流式识别（SimulStreaming）在这台机器上跑不跑得动、快不快：`python check_simul_stream.py [模型] [--long-sec 28] [--no-eurollm]`。它量的是当初拦住 Stage 2 的那几个数：加载与预热耗时、单次提交耗时与实时倍率、**词时间是不是绝对流时间**（拿 `check_word_alignment.py` 那套真值验）、终稿靠不靠得住、与 EuroLLM 同驻会不会 OOM；`--long-sec` 加测"连着说 N 秒"的单次提交耗时（`simul_max_utterance_sec` 的依据，**必须用真实语音**，见下）。
 - 量同步误差是谁的锅：`python check_word_alignment.py [模型] [间隔秒 ...]`。用 Windows 自带语音合成把词按固定间隔摆好（真实起点已知），再跑一遍识别，打印"Whisper 给的词起点 vs 真值"的误差——用来分清"字幕对不上声音"是识别的时间轴不准，还是我们自己的播放进度算错了。
 - 检查原文两行 / 换句滚动 / 译文行溢出上滚：`python check_reveal_scroll.py`。离屏（`QT_QPA_PLATFORM=offscreen`）喂一串脚本化的句子，每隔 20ms `grab()` 一次扫像素，用文字行的位置验几何：行距 = `lineSpacing()`、第一行贴框顶、逐词增长时位置不动、滚动全程不超两行且滚完停在原位、不翻译模式也两行、整句通路不被裁剪，以及上/中/下三处间隙相等、窗口高度正好贴内容、间隙随字号变（`--live` 用 settings.json 里那套）。译文行那几项按"框 = min(行数,2) 行、内容按实际行数、偏移 = (行数−2)×行距"验。另验两条**不是几何的**：关掉「原文逐词显示」后原文整句也左对齐（用左边第一个墨点验），且折成两行的整句不被裁、窗口跟着长；「仅显示译文」下逐词原文一个字都不许上屏（说话期间整窗无墨），译文只在整句译文到了才出现。不带音频/Whisper。
-- 检查设置面板：`python check_settings_ui.py`。离屏建一次 `MainWindow`（不启音视频/识别），验整页在 `QScrollArea` 里、左右两列、"高级设置"默认收起、启动尺寸夹到屏幕可用区域，以及合并后的「语音识别设置」：只有一个模型下拉、候选随后端变、**流式后端下回填整句模型名不许写进 `simul_model`**、流式那几行按后端显隐，以及两个逐词开关（「原文逐词显示」/「译文逐词显示」）都在、勾选状态来自配置，旧的「边说边翻译」已经不存在、`simul_prefix_spin`（译文刷新间隔）两种后端下都看得见。脚本会写 settings.json（`resizeEvent` 存窗口大小），跑完原样放回。
+- 检查设置面板：`python check_settings_ui.py`。离屏建一次 `MainWindow`（不启音视频/识别），验整页在 `QScrollArea` 里、左右两列、"高级设置"默认收起、启动尺寸夹到屏幕可用区域，以及合并后的「语音识别设置」：只有一个模型下拉、候选随后端变、**流式后端下回填整句模型名不许写进 `simul_model`**、流式那几行按后端显隐，以及两个逐词开关（「原文逐词显示」/「译文逐词显示」）都在、勾选状态来自配置，旧的「边说边翻译」已经不存在、`simul_prefix_spin`（译文刷新间隔）两种后端下都看得见；末尾还验显存回收那几个控件——切到 Google 后「显存」状态行和「释放显存」按钮**照样在**（它们不在本地模型那一块里），闲置卸载旋钮/「自动回收」勾选状态来自配置，取消勾选会把账本三项的超时都设成 0（只认手动）。脚本会写 settings.json（`resizeEvent` 存窗口大小），跑完原样放回。
+- 查反复启停会不会把显存占满：`python check_gpu_reclaim.py [--cycles 5] [--backend simul|batch] [--model small] [--device 关键词] [--skip-ollama] [--skip-sweep] [--keep-warm]`。真录音、真装卸模型，每轮打印"活着的 `audio-stream-recognize` 线程数 / `memory_allocated` / `memory_reserved` / nvidia-smi / 引擎是复用还是新建 / 加载耗时"，判定线程数每轮回到 0~1、第 2 轮起复用同一个引擎对象、全程只有一份引擎、已分配显存不逐轮上涨；然后 `release_all(force=True) + free_cuda_cache()` 看回不回落到基线；再**热一轮 + 把闲置超时压到 1 秒 + 手动 `sweep()`**（单测里释放回调是假的计数器，只有这里能证明自动回收真把显存放下了）；最后验 Ollama 的 `unload` / `unload_others`（卸完 `/api/ps` 里确实没了、`_warm_model` 已清、连不上时返回 False/0 且不抛异常）。**照 CLAUDE.md 记的那套配置量就得给 `--model small`**——本机 settings.json 里 `simul_model` 可能是个 tiny（加载 536 ms / 153 MiB），小得看不出问题。脚本会改 settings.json 的 `asr_backend`（给了 `--model` 时还有 `simul_model`），跑之前备份、`finally` 原样放回（**内存里那两份也要放回去**：`config.set` 会把整个 settings 字典重写一遍，只还原文件、忘了内存，下一次 `set` 又把它写脏了）。
+- 显存账本的单测（不碰显卡/音频/Qt，全用假的释放回调）：`python test_model_residency.py`
 
 ## Architecture
 
@@ -50,7 +52,8 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - `third_party/` — vendored 的 ufal/simulstreaming（MIT，来源与改动见 `third_party/PROVENANCE.md`），只有流式识别用得到。
 - `audio/audio_processor.py` — `AudioProcessor`（Whisper 模型加载、CUDA/CPU 选择、降级逻辑）+ `WhisperThreadPool`（后台异步识别，带超时取消）。同步 `process_audio` 与异步 `process_audio_async(callback)` 两套接口。
 - `translation/subtitle_manager.py` — `SubtitleManager`，翻译管线编排：术语处理（`TermManager`）+ 传输层（第 5 步按 `translation_backend` 分派到本地模型或 googletrans）+ 整段结果的 LRU 缓存 + 延迟统计。
-- `translation/local_llm_translator.py` — `LocalLLMTranslator`，**默认的翻译后端**：HTTP 调本机的 Ollama（或 llama.cpp 的 llama-server）。含探活 `health()`、预热 `preload()`（真跑一步 `num_predict=1`，加载期选项与真翻译一致）、真翻一句的 `self_test()`（界面"测试连接"用，把加载与翻译两段耗时分开报）、耗时明细 `last_stats`；方法一律不抛异常，失败只记 `last_error` 并返回 None。
+- `translation/local_llm_translator.py` — `LocalLLMTranslator`，**默认的翻译后端**：HTTP 调本机的 Ollama（或 llama.cpp 的 llama-server）。含探活 `health()`、预热 `preload()`（真跑一步 `num_predict=1`，加载期选项与真翻译一致）、真翻一句的 `self_test()`（界面"测试连接"用，把加载与翻译两段耗时分开报）、耗时明细 `last_stats`；方法一律不抛异常，失败只记 `last_error` 并返回 None。**"用完就还"也是这一侧的活**：`unload()` / `unload_others()` / `resident_models()`（见"显存回收"一节）。
+- `model_residency.py` — 全局单例 `model_residency`：**谁在占显存、什么时候该放**的唯一账本（`register`/`touch`/`release`/`release_all`/`sweep`/`snapshot`/`describe`）。刻意不认识任何具体类（释放回调是调用方给的薄绑定方法），所以不引入 `audio/ ↔ translation/` 的循环导入，界面和单测也能安全导入它；配套的 `free_cuda_cache()`（`gc.collect()` + 惰性 import torch + `empty_cache()`）和 `cuda_memory_mib()` 同理。详见"显存回收"一节。
 - `translation/term_manager.py` — `TermManager`，业余无线电术语处理：信号报告转换（"five nine"→"59"）、字母解释法呼号还原（"Alpha Bravo"→"AB"）、术语占位符保护。
 - `translation/subtitle_file_manager.py` — `SubtitleFileManager`，将识别结果写为 `Subtitles/*.srt`。
 - `config.py` — 全局单例 `config`，JSON 持久化到 `settings.json`，自动补齐默认项。
@@ -114,7 +117,7 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - **窗口高度默认贴着内容走**（`window_height_auto` / `_fit_window_height`）：`_required_height()` = 三处间隙 + 各可见裁剪框的最小高度，高度就是它——字号/行数一变，窗口跟着收放（译文行只在 1 行↔2 行之间变，再长往上滚），不会在原文和译文之间挂一片空白。`window_height_auto = False` 表示"高度是用户定的"：设置里改过高度（`on_window_height_changed` → `_lock_window_height`）或**按住鼠标**拖右下角（`resizeEvent` 里查 `QApplication.mouseButtons()`）之后就是这种状态，之后一律按他定的高度来（多出来的空间三处平分）。为什么要看鼠标键：Qt 自己在显示/隐藏过程中发的 resize 不该被当成"用户拖的"，否则高度一次就锁死、再也不跟着内容走。另外 Qt 的 `setFixedSize` 走的是 C++ 的 `resize`（`QWidget.resize` 不是虚函数），绕不过我们的重写，所以 `showEvent` 里那次精确尺寸要用 `_auto_set_fixed_size` 包一下（`_auto_resize_depth` 计数），不然同样会被当成用户拖的。
 - **仅显示译文**（`subtitle_mode == "translated"`）：屏幕上**只**有译文，说话期间那一行是空的，原文一个字都不上屏。判据是 `_word_reveal_visible()` ＝ `not (subtitle_mode == "translated" and not translation_disabled())`：`set_original_words` / `_set_reveal_text` 开头照它直接返回（后者顺带丢掉 `_reveal_pending`），`set_subtitle_mode` 切进来时停滚 + 丢 `_reveal_pending` + 把原文标签清空（免得切回"两者"时闪一眼上一句旧文本）。**这里曾经有三处来源让原文先冒出来、还穿着译文的字体颜色/字号**：① 逐词通路**借译文标签**（`_reveal_label`）——译文标签被原文占了，颜色字号自然整套都用译文的；② `update_text` 单参数版在 `translated` 模式下照样写译文行；③ `update_text` 双参数版"没有译文就先拿原文顶一下"；外加 `_show_original_text` 在 `translated` 模式下也照写。四处全删了，所以**不管谁调用，`translated` 模式下译文行只可能由真译文写入**。（"不翻译"是例外：`translation_disabled()` 时模式虽然也是"仅显示译文"，但屏幕上本来就该只有原文，所以不屏蔽。）
 - **不翻译**（目标语言选"不翻译"→ `target_language = "none"`）：只走原文通路，不提交翻译请求，字幕窗只留原文行（`SubtitleWindow.translation_disabled` 会强制隐藏译文行）。
-- 排查工具：`python check_word_timestamps.py <wav> [模型] [设备]` 打印每词时间轴，用来区分"逐词不生效"是模型问题还是设置问题；`python check_reveal_scroll.py`（`--live` 用 settings.json 里那套字号/窗口）离屏喂一串脚本化的句子、扫像素验几何（行距、贴顶、滚完不跳、不翻译模式也两行、整句通路不被裁剪），并逐个量：上/中/下三处间隙必须相等、等于 `_row_gap()` 那个按字号算的基准、窗口高度正好是 `_required_height()`，字号改大时间隙跟着变大，把窗口拉高 90px 后三处各分到 30px；译文行那几项按上表验——框 = `min(行数,2)` 行、内容按实际行数、偏移 = `(行数−2)×行距`，可见的正是最后两行、首行贴框顶、窗口高度不变（滚动不吃窗口高度）、`clear_translation` 后偏移归零、1 行→2 行只长一个行距、3 行时偏移是渐变而非瞬移、切模式后偏移归零；还验"关掉逐词后原文整句也左对齐、折两行不被裁、窗口跟着长"和"仅显示译文下说话期间整窗无墨、译文只在整句译文到了才出现"。开关 `word_by_word_enabled=False` 可完全退回整句原文行为，`translation_word_by_word=False` 可完全退回整句译文行为。
+- 排查工具：`python check_word_timestamps.py <wav> [模型] [设备]` 打印每词时间轴，用来区分"逐词不生效"是模型问题还是设置问题；`python check_reveal_scroll.py`（`--live` 用 settings.json 里那套字号/窗口）离屏喂一串脚本化的句子、扫像素验几何（行距、贴顶、滚完不跳、不翻译模式也两行、整句通路不被裁剪），并逐个量：上/中/下三处间隙必须相等、等于 `_row_gap()` 那个按字号算的基准、窗口高度正好是 `_required_height()`，字号改大时间隙跟着变大，把窗口拉高 90px 后三处各分到 30px；译文行那几项按上表验——框 = `min(行数,2)` 行、内容按实际行数、偏移 = `(行数−2)×行距`，可见的正是最后两行、首行贴框顶、窗口高度不变（滚动不吃窗口高度）、`clear_translation` 后偏移归零、1 行→2 行只长一个行距、3 行时偏移是渐变而非瞬移、切模式后偏移归零；还验"关掉逐词后原文整句也左对齐、折两行不被裁、窗口跟着长"和"仅显示译文下说话期间整窗无墨、译文只在整句译文到了才出现"。开关 `word_by_word_enabled=False` 可完全退回整句原文行为，`translation_word_by_word=False` 可完全退回整句译文行为。**本机 settings.json 里 `window_height_auto` 是 `false`**（用户手动拖过高度），所以脚本非 `--live` 那套会显式把它钉成 `True`（否则量"窗口高度 = `_required_height()`"必挂），`--live` 遇到用户锁了高度就把这几项标成`[跳过]`并说明原因，不再误报不通过。
 
 ### 流式识别（SimulStreaming，`asr_backend="simul"`）
 
@@ -129,6 +132,7 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - **实测代价**（`python check_simul_stream.py small --long-sec 28`，small + GTX 1070 Ti + 真实语音）：单次提交 190~330 ms（28 秒时最慢 330 ms，提交间隔 800 ms），定稿 150~220 ms，torch 峰值 1403 MiB；加载 2.5 s、预热 0.9 s（第一次解码要编译 CUDA 内核，所以开始翻译前先 `warmup()`，这期间音频排着队，就绪后一口气追平）。**显存**：流式模式下不会去加载整句模型（`audio_queue` 全程空转），但用户之前手动加载过的那个仍占着显存；流式 small 1.4 GB + EuroLLM-Q8 1.65 GB 同驻没问题。
 - **量长句的代价必须用真实语音，不能用"同一批词重复摆"**：重复内容会把贪婪解码带进重复死循环（实测 20 秒的重复词表被识别成 141 个词 ≈ 7 词/秒，正常语速 2.6），而 `finish()` 内部写死了 `frames_threshold=4`（比我们的 12 松得多），一旦解不出句尾就一路解到 448 token 上限，词对齐的张量跟着涨到 GB 级——定稿一次 **75 秒**、吃掉 5 GB 显存（`check_simul_stream.py` 的 `synth_passage` 就是为此用 SAPI 念整段真实话）。
 - 第三方源码在 `third_party/`（ufal/simulstreaming，MIT，来源与改动见 `third_party/PROVENANCE.md`），它内部按 `simulstreaming.*` 绝对导入，路径由 `audio/simul_asr.py` 的 `add_library_to_path()` 插到 `sys.path` 最前（认"同目录下既有 `simulstreaming/` 包又有 `simulstreaming_whisper.py`"这种长相，也可以用 `SIMULSTREAMING_HOME` 指到别处）。
+- **引擎会在多轮「开始/停止」之间复用**（签名不变就不重建，第二轮点开始立刻出字），停止只记一笔"刚用过"、不立刻卸；什么时候真卸、卸载的回调怎么写，见下面"显存回收"一节。
 - **改 `audio/simul_asr.py` 之前先跑 `check_simul_stream.py`**：它把上游那三个坑都量过一遍（每次只回当前这一段、词时间是绝对流时间、`finish()` 不能当整句重来且尾部静音会吐 `[static]`），数字变了说明上游或环境变了。
 
 ### 译文逐词显示（`translation_word_by_word`，两种后端都吃）
@@ -146,6 +150,33 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - 逐句模式（不勾）下浮窗在"说话中"是空白的——这本来就是"只显示译文 + 等整句"的含义；勾上就有东西看了。
 - **旧键 `simul_simultaneous_translate`**（只在流式后端下有效的「边说边翻译」复选框）已删除，由 `config.py` 的 `_migrate_settings()` 迁到新键（以旧值为初始值，所以原来关着的用户升级后还是关着）。迁移**必须赶在 `ensure_all_settings_exist` 补默认值之前**读旧键：补完默认值新键就"已经存在"了，用户关掉的那个开关会被默认的 `True` 顶掉。
 
+### 显存回收（`model_residency`）：反复启停不再累积
+
+**症状**：反复点「开始/停止翻译」多次后 GPU 被占满（本机实测 `nvidia-smi` 7836/8192 MiB，`ollama ps` 里 EuroLLM-Q8 1.65 GB 与 Spark-X2.5-1.7B 3.5 GB **同时挂在卡上**），原文和译文都不流畅（卡顿/译文质量差/识别错漏三种症状一起来的）。根因四条，全改掉了：
+
+1. **流式引擎每轮新建、从不卸载、旧线程不退出**（主因）。
+   - `_prepare_streaming` 命中签名就**复用**上一轮的引擎对象（签名 = 模型名 + 界面能改的那几个流式参数 + 语种等），省掉每轮 2.5 秒加载 + 1.4 GB 重载——这就是"第二轮点开始立刻出字"。
+   - 签名不符才建新引擎对象（**建对象是廉价的、不含加载**），旧引擎作为 `retired` 交给**流式线程**：线程开头先 `retired.unload()` 再 `warmup()` 新的 → **任何时刻卡上只有一份 whisper**，不会 OOM；卸载放在线程里做，界面线程不会被 `empty_cache()` 卡住。
+   - **每轮的队列和停止 Event 归这一轮**：新建 `queue.Queue()` / `threading.Event()` 一并传给线程，旧线程捕获的是旧对象，永远读不到新一轮的事件。**删掉了那段无条件清空 `stream_queue` 的代码**——它会把上一轮还没被消费的 `"stop"` 一起吞掉，旧 daemon 线程于是永不退出：抱着旧引擎占显存，还和新线程抢同一个队列（屏幕上是乱句/重复/丢句）。这是"识别错漏多"的一条直接来源。
+   - 线程循环同时看队列和 Event（`while not stop.is_set(): queue.get(timeout=0.2)`），退出条件不再只依赖队列里那一条 `"stop"`。
+   - `SimulStreamingEngine.unload()` 补 `gc.collect()` 再 `empty_cache()`（引用没断干净拿不回全部显存）；`warmup()` 加 `_warmed` 短路（热引擎约 0.3 秒）。
+2. **Ollama 侧原本没有任何卸载通路**（`check_local_translate.py` 里那个 `unload_model()` 主程序从不调用）。现在：`unload(model)` = `POST /api/generate {"model": m, "keep_alive": 0}`（OpenAI 兼容那条路没有通用卸载通路 → 返回 False 并说明）；`unload_others(keep)` 卸掉除 keep 之外的驻留模型；`resident_models()` 读 `GET /api/ps`。**换模型 / 点「测试连接」前先 `unload_others(新模型)`**（`preload()` 开头就做，开关 `unload_previous_llm_on_switch`）——8 GB 卡上多模型同驻会让 Ollama 把刚加载的挤掉再重载（见别处的 `aborting load`），表现就是"某些句子回落成原文"。生产代码里的 `unload()` **不同步轮询 `/api/ps`**（会卡界面），"是不是真卸掉了"交给 `check_gpu_reclaim.py` 去查。
+3. **「停止翻译」原本什么都不回收**：现在停止分支会 `translation_worker.stop()`，而它同时把 `_requests`/`_results` 抽干——以前只把 `_running` 置 False，残留请求还在队列里，线程继续向 Ollama 发请求、不断续期 `keep_alive`（"闲置 30 分钟自动释放"因此几乎不发生）。注意工作线程是 daemon + `join(timeout=1)`，手上那条冷翻译最长 120 秒，**stop 兜不住它**，这一段正是闲置 sweep 要接住的。
+4. 杂项：`ui_update_queue` 改有界（`maxsize=64`，满了一律丢弃——它只被 put 从不被 get）；`whisper_model.log` 加轮转（5 MB × 1 份备份）；`WhisperThreadPool(max_workers=2)` → 1（与它自己的 docstring 一致）并给 `get_model()` 加锁（切模型时两个 worker 会各加载一份、丢一份）；播放流存进 `self.output_stream` 让 `_cleanup_pyaudio` 关得到；`requirements.txt` 补 `requests`（**它本来就装上了**——googletrans 的依赖，所以"本地翻译不需要任何新 pip 依赖"这句依然成立）。
+
+**停止 = 只记一笔「刚用过」，不立刻卸**（这是"反复启停不卡"的关键：模型留在卡上给下一轮复用）。真卸载只有三条路：闲置到点自动 sweep、「释放显存」按钮、参数或模型变更。由此：
+
+- **账本**：`register(key, label, release_fn, kind, idle_timeout, guard_fn)`，key 是 `asr_simul` / `asr_batch` / `llm`。`release_fn` **必须是"读当前状态"的薄绑定方法**（如 `_release_stream_engine`），**不许闭包捕获具体引擎对象**——引擎会按签名重建，捕获住的那个早就不是当前的了。`guard_fn` 挡住"正在识别时不许卸"（`lambda: not self.is_running`）。
+- **`release()` 失败要把 `resident` 改回 True**：模型没真卸掉、账上却记成"已经没占着"，那它就再也不会被回收——这一轮修的正是这种静默的漏。而 `guard_fn` 自己抛异常要**放行**（记一笔然后照样卸），不能被一个坏 guard 拦住回收。
+- 配置三项：`model_idle_unload_enabled`（关掉 = 只认手动点「释放显存」）、`model_idle_unload_sec`（默认 300）、`unload_previous_llm_on_switch`。**识别模型和本地大模型共用这一个秒数**——界面上就一个旋钮，配两个键等于撒谎。`MainWindow._apply_residency_settings()` 在 `__init__` 里把秒数写进账本；**`register()` 的默认 `idle_timeout` 是 `None`（从不）**，所以不带界面的脚本（`check_gpu_reclaim.py`）看到的账本超时是「从不」，这是对的，不是没生效。
+- 界面：本地模型那一块**之外**加一行「显存」（`residency_label`）+「释放显存」按钮（`on_release_gpu` 后台线程跑 `release_all()` + `free_cuda_cache()`）；「高级设置」里本地模型那组加闲置秒数旋钮 + 「自动回收」勾选框。那一行刻意不放进 `local_llm_box`：**它报的是整台机器的驻留情况，识别模型才是大头的占位者**，换翻译引擎不该把它藏起来。
+- `main.py` 里 `app.aboutToQuit` → `release_all(force=True)`：`closeEvent` 覆盖不到崩溃/被杀/注销这几条路。`closeEvent` 自己在原有的 `gc.collect() + empty_cache()` **之前**先 `release_all(force=True)` + `close_local()`。
+- **`_stream_live()` 必须带后端守卫**（`self.asr_backend == "simul" and …`）：引擎保活之后，切回整句后端时 `stream_engine` 不再是 None，旧判据会让整句通路误以为流式还活着。加了守卫之后 batch 下返回值与以前**完全相同**（`stream_engine` 本来是 None），"整句行为逐字节不变"这条承诺得以保持。`get_stream_status()` 同理。
+- **`unload()` 成功卸掉当前模型时必须清 `_warm_model`**，否则闲置卸载之后下一句仍按"热模型"用 3 秒超时发，而模型其实要冷加载（1.7B-Q8 实测 1.4 秒、9B 10.8 秒）→ 必然 ReadTimeout → 第 5 步回落成**英文原文**上屏。这是"译文质量差 / 屏幕混英文"的另一条来源。改服务地址或接口类型时也要 `forget_warm()`。
+- **`requests.Session` 的实例属性不能叫 `self._session`**：和 `_session()` 方法同名，直接把方法盖成 `None`，报 `'NoneType' object is not callable`——本机实测的症状是 `check_gpu_reclaim.py` 的 Ollama 那一段整段静默地走"连不上"分支。属性名是 `self._http_session`。`_request()` 对**超时不重试**（超时是有意义的结论），只有连接类错误才丢会话重试一次。
+
+**实测**（`python check_gpu_reclaim.py --cycles 4 --model small`，GTX 1070 Ti）：small 加载 2224 ms、预热 569 ms；4 轮启停线程数 `[0,0,0,0]`、第 2 轮起复用同一个引擎、已分配**恒定 933 MiB**（偏差 0）；`release_all()` 后回到 8 MiB；把闲置超时压到 1 秒再 `sweep()`，932 MiB 真的放成 8 MiB 且 `manager.stream_engine` 变 None。
+
 ## 需要注意的约定与陷阱
 
 - **`settings.json` 是运行时的活配置**，被 git 跟踪，`config.set()` 每次都会立即写回文件。改动配置逻辑时留意兼容旧字段（`main_window.py` 的 `check_and_update_settings` 负责旧版本迁移）。**写文件必须原子**（`save_settings` 先写 `settings.json.tmp` 再 `os.replace`，另有 `_write_lock` 防多线程互踩）：曾经直接 `open('w')` 把文件截成 0 字节，结果所有设置静默回落到默认值（模型从 tiny 变 base）；`load_settings` 现在遇到坏文件会打印错误并留一份 `.broken` 备份，不再默默用默认值。
@@ -159,6 +190,7 @@ python test_prefix_translation.py   # 「译文逐词显示」的界面调度（
 - **翻译依赖网络**（Google 翻译免费接口），无网络或限流时翻译会失败——`translate` 失败时回退返回原文/已处理文本，而非抛异常。**默认后端已经换成不依赖网络的本地 EuroLLM**（见"本地翻译"小节）；`translation_backend="google"` 才走这条公网路，界面上"翻译设置 → 翻译引擎"可以随时切。
 - **本地翻译要有一个在跑的本机推理服务**（默认 Ollama 的 `http://127.0.0.1:11434`）。服务没起来、模型没拉下来、超时，都只记 `last_error` 并**抛给第 5 步的 except 去回落**（返回已处理文本），界面不崩但字幕会是原文；界面上"翻译设置 → 本地状态 / 测试连接"能直接看出是哪种情况。本机实测 EuroLLM-1.7B-Q8 在 GTX 1070 Ti 上是 100% GPU、约 3497 MiB 显存。
 - **换模型报"测试失败"先怀疑加载，不要先改提示词**（`alibayram/erurollm-9b-instruct`、`SparkLLM/Spark-X2.5-1.7B` 都实测过）：9B 是纯冷加载比单句超时长（10.8 秒 vs 3000ms），Spark 是思考型模型把 token 全花在 `message.thinking` 上。两者的修法都在代码里（长超时 + `think:false`），提示词一个字没动。**这两条只对"能翻译的模型"成立**：Spark-X2.5 修完照样吐提示词残渣，不适合当翻译后端。
-- **动过 Ollama 的加载期参数（`local_llm_num_ctx` 等）或 `local_llm_keep_alive` 之后，先跑一次 `preload()`（界面"测试连接"）**，否则下一次真翻译会撞上"换参数重载"。同一张显卡上驻留多个模型时，Ollama 会挑着卸（实测 8GB 卡上 qwen2.5 与 EuroLLM 同驻没问题，但加载大模型会挤掉小模型）。
+- **动过 Ollama 的加载期参数（`local_llm_num_ctx` 等）或 `local_llm_keep_alive` 之后，先跑一次 `preload()`（界面"测试连接"）**，否则下一次真翻译会撞上"换参数重载"。同一张显卡上驻留多个模型时，Ollama 会挑着卸（实测 8GB 卡上 qwen2.5 与 EuroLLM 同驻没问题，但加载大模型会挤掉小模型）。**现在我们自己会主动清场**：换模型/点测试连接前 `unload_others()`、闲置 `model_idle_unload_sec` 秒后自动卸、界面「释放显存」一按全放掉（见"显存回收"一节）。
+- **判断"显存被谁占了"先看 `ollama ps` 和 `model_residency.describe()`，别只看 nvidia-smi**：识别模型（流式 small 约 1.4 GB）和本地大模型（EuroLLM-Q8 约 1.65 GB）是两笔独立的账，界面上「显存」那一行同时报这两笔；`nvidia-smi` 的数字还要跟别的进程分账，而且 `empty_cache()` 之后它会滞后一会儿才下来。
 - **调试日志**：`audio/audio_manager.py` 内 `DEBUG_MODE = True` 会向控制台输出大量日志（日志同时写入 `whisper_model.log`）；`gui/main_window.py` 的 `DEBUG_MODE = False`。
 - 术语库位于 `translation/resources/ham_radio_terms.json`，可通过编辑 JSON 扩展，`TermManager` 负责加载/校验/保存。

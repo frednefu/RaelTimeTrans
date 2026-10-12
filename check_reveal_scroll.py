@@ -165,10 +165,17 @@ def main():
     settings = {"word_by_word_enabled": True, "subtitle_mode": "both",
                 "target_language": "zh", "position": "bottom"}
     if "--live" not in sys.argv[1:]:
+        # `window_height_auto` 也要钉住：它是"用户拖过窗口右下角"之后被写进
+        # settings.json 的运行态（本机实测就是 false）。不钉的话这一项从用户的配置文件
+        # 里随机读，脚本里的 window_height=131 就变成"故意定的高度"，"窗口贴着内容"
+        # 那几项必然不通过 —— 而且和代码有没有改过毫无关系。
         settings.update(original_font_size=14, translation_font_size=19,
                         original_font_family="Arial", translation_font_family="黑体",
-                        window_width=1000, window_height=131)
+                        window_width=1000, window_height=131, window_height_auto=True)
     use_config(**settings)
+    # 高度是用户定的（window_height_auto=False）时，"窗口正好贴着内容"这类检查没有
+    # 意义：那时窗口高度本来就该由用户说了算，多出来的空间三处平分。--live 下会碰到。
+    fit_checks_apply = bool(config.get("window_height_auto", True))
 
     QApplication.instance() or QApplication([])
     window = SubtitleWindow()
@@ -176,6 +183,19 @@ def main():
     QTest.qWait(200)  # 让布局/显示事件走完
 
     checker = Checker()
+
+    def check_fit(message):
+        """窗口高度是不是正好贴着内容
+
+        高度由用户定的时候（`window_height_auto=false`：他在设置里改过高度，或拖过
+        窗口右下角）这一项不适用——那时窗口本来就该保持他定的高度，多出来的空间三处
+        平分，而不是被收掉。
+        """
+        if not fit_checks_apply:
+            print(f"  [跳过] {message}（window_height_auto=false，高度是用户定的）")
+            return
+        checker.check(abs(window.height() - window._required_height()) <= 1, message)
+
     pitch = QFontMetrics(window.original_label.font()).lineSpacing()
     view_top = window.original_view.mapTo(window, QPoint(0, 0)).y()
     print(f"原文行距（QFontMetrics.lineSpacing）: {pitch}px")
@@ -207,9 +227,8 @@ def main():
     checker.check(window._row_gap() == expected_gap,
                   f"间隙按字号算 = {ROW_GAP_RATIO} × 较小行距（期望 {expected_gap}，"
                   f"实测 {window._row_gap()}）")
-    checker.check(abs(window.height() - window._required_height()) <= 1,
-                  f"窗口高度正好是内容需要的高度，没有多余空白（窗口 {window.height()}，"
-                  f"需要 {window._required_height()}）")
+    check_fit(f"窗口高度正好是内容需要的高度，没有多余空白（窗口 {window.height()}，"
+              f"需要 {window._required_height()}）")
     label = window.original_label
     text_left = window.original_view.mapTo(window, QPoint(0, 0)).x() \
         + window._label_padding(label) + REVEAL_LEFT_MARGIN
@@ -359,9 +378,8 @@ def main():
     checker.check(window._required_height() > one_line_required,
                   f"行数变多，窗口需要的高度跟着涨（{one_line_required} → "
                   f"{window._required_height()}px）")
-    checker.check(abs(window.height() - window._required_height()) <= 1,
-                  f"窗口高度贴在内容上（窗口 {window.height()}，需要 "
-                  f"{window._required_height()}）")
+    check_fit(f"窗口高度贴在内容上（窗口 {window.height()}，需要 "
+              f"{window._required_height()}）")
     window.update_text(original_text="THIS IS A WHOLE SENTENCE",
                        translation_text="这是一整句译文")
     QTest.qWait(50)
@@ -405,9 +423,8 @@ def main():
     checker.check(wrapped[-1][1] - wrapped[-1][0] >= wrapped[-2][1] - wrapped[-2][0] - 2,
                   f"译文最后一行没被裁掉半截（最后一行 {wrapped[-1][1] - wrapped[-1][0]}px vs "
                   f"上一行 {wrapped[-2][1] - wrapped[-2][0]}px）")
-    checker.check(abs(window.height() - window._required_height()) <= 1,
-                  f"译文折成两行后窗口跟着变高（窗口 {window.height()}，需要 "
-                  f"{window._required_height()}）")
+    check_fit(f"译文折成两行后窗口跟着变高（窗口 {window.height()}，需要 "
+              f"{window._required_height()}）")
     checker.check(abs(ink_left(window, wrapped[-1]) - ink_left(window, wrapped[1])) <= LEFT_TOL,
                   f"译文行和原文行的左边界对齐（译文 {ink_left(window, wrapped[-1])}px vs "
                   f"原文 {ink_left(window, wrapped[1])}px）")
@@ -518,9 +535,8 @@ def main():
                   f"字号变大，间隙跟着变大（{small_gap} → {window._row_gap()}）")
     checker.check(big_window_gaps[0] == big_window_gaps[1] == big_window_gaps[2],
                   f"换字号后三处间隙照样一样宽（{big_window_gaps}）")
-    checker.check(abs(window.height() - window._required_height()) <= 1,
-                  f"换字号后窗口还是贴着内容（窗口 {window.height()}，"
-                  f"需要 {window._required_height()}）")
+    check_fit(f"换字号后窗口还是贴着内容（窗口 {window.height()}，"
+              f"需要 {window._required_height()}）")
 
     # 10) 用户把窗口拉高：多出来的空间三处平分，而不是全堆在原文和译文中间
     window.resize(window.width(), window.height() + 90)

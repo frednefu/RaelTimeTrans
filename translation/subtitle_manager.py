@@ -4,6 +4,7 @@ import threading
 from collections import OrderedDict
 
 from config import config
+from model_residency import model_residency
 from translation.local_llm_translator import (LocalLLMTranslator,
                                               normalize_placeholders,
                                               strip_leftover_placeholders)
@@ -24,6 +25,11 @@ class SubtitleManager:
         self.local_translator = None
         self.local_last_error = None
         self.lock = threading.Lock()  # 线程锁，防止多线程同时访问缓存
+
+        # 把本地大模型登记进全局显存账本（闲置自动卸载、「释放显存」都读它）。
+        # release_fn 必须是"查当前状态"的薄方法，不能闭包捕获某个 translator 对象。
+        model_residency.register("llm", "本地翻译", self._release_local_model,
+                                 kind="ollama")
         
         # 初始化术语管理器
         self.term_manager = TermManager()
@@ -243,6 +249,34 @@ class SubtitleManager:
         """给界面的下拉框用：本地服务里都有哪些模型（连不上返回空列表）"""
         return self._get_local_translator().list_models() or []
 
+    def local_resident_models(self):
+        """现在显存里驻留着哪些模型（`[(名, MiB, 到期时刻), …]`，连不上返回 []）"""
+        return self._get_local_translator().resident_models() or []
+
+    def local_unload(self, model=None):
+        """把本机大模型从显存里卸掉（闲置回收 / 「释放显存」/ 切翻译引擎走这里）"""
+        return self._get_local_translator().unload(model)
+
+    def local_unload_others(self, keep=None):
+        """卸掉除 `keep` 之外所有驻留的模型（换模型时先清场），返回卸掉的数量"""
+        return self._get_local_translator().unload_others(keep)
+
+    def _release_local_model(self):
+        """显存账本的回调：卸掉本机的翻译模型（没建过客户端就什么都不用做）"""
+        if self.local_translator is None:
+            return
+        self.local_translator.unload()
+
+    def close_local(self):
+        """放掉本地翻译客户端（关窗口时调）"""
+        if self.local_translator is not None:
+            self.local_translator.close()
+
+    def local_forget_warm(self):
+        """换了服务地址/接口类型之后，别再以为旧服务上的模型还是热的"""
+        if self.local_translator is not None:
+            self.local_translator.forget_warm()
+
     def _transport_translate(self, preprocessed_text, target_code, debug=False):
         """第 5 步那一次真正的传输：按 translation_backend 分派到本地模型或谷歌
 
@@ -261,6 +295,8 @@ class SubtitleManager:
         result = translator.translate(preprocessed_text, target_code)
         self.local_last_error = translator.last_error
         if result is not None:
+            # 刚用过：重置闲置计时（这一句之后模型确确实实留在显存里了）
+            model_residency.touch("llm")
             return result
         if config.get("local_llm_fallback_to_google", False):
             if debug:

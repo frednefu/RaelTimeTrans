@@ -13,6 +13,7 @@ import time
 from PySide6.QtWidgets import QApplication
 
 from audio.audio_manager import AudioManager, clean_device_name, display_device_name
+from model_residency import model_residency, free_cuda_cache, cuda_memory_mib
 from translation.subtitle_manager import SubtitleManager
 from translation.translation_worker import TranslationWorker, KIND_PREFIX
 from gui.subtitle_window import SubtitleWindow
@@ -70,6 +71,25 @@ class MainWindow(QMainWindow):
         self.volume_timer.setInterval(80)
         self.volume_timer.timeout.connect(self.update_volume_meter)
         self.volume_timer.start()
+
+        # 显存账本：2 秒看一眼"谁占着、闲了多久"，到点的放掉（见 model_residency）。
+        # 停止翻译时模型故意留着给下一轮复用，真正的回收就发生在这个定时器里。
+        # 显存那一行的状态：后台线程只写 *_result，界面线程的定时器取回来（和本地服务
+        # 探活同一套办法——Qt 控件只能在界面线程里动）
+        self._residency_releasing = False       # 「释放显存」正在后台跑（防重入）
+        self._residency_release_result = None
+        self._resident_models = None            # 最近一次问到的驻留名单
+        self._resident_query_result = None
+        self._resident_query_running = False
+        self._resident_tick = 0
+
+        self._residency_timer = QTimer(self)
+        self._residency_timer.setInterval(2000)
+        self._residency_timer.timeout.connect(self._on_residency_tick)
+        self._apply_residency_settings()
+        self._start_resident_query()      # 启动就先问一次，那行状态不至于空 10 秒
+        self._refresh_residency_label()   # 先画一版（本地数据，不用等服务回话）
+        self._residency_timer.start()
 
         # 记录当前显示的文本，避免重复更新相同内容
         self.current_displayed_text = ""
@@ -442,7 +462,28 @@ class MainWindow(QMainWindow):
         timeout_row.addWidget(self.local_timeout_spin)
         timeout_row.addStretch(1)
 
-        # 服务地址 / 接口类型 / 单句超时是装好之后就很少动的，收进"高级设置"；
+        idle_row = QHBoxLayout()
+        idle_row.addWidget(self._fixed_label("闲置卸载:"))
+        self.idle_unload_spin = QSpinBox()
+        self.idle_unload_spin.setRange(0, 7200)
+        self.idle_unload_spin.setSingleStep(60)
+        self.idle_unload_spin.setSuffix(" 秒")
+        self.idle_unload_spin.setSpecialValueText("从不")
+        self.idle_unload_spin.setValue(int(config.get("model_idle_unload_sec", 300)))
+        self.idle_unload_spin.setToolTip(
+            "停止翻译之后，闲置这么久就把识别模型和本地大模型从显存里放掉（0 = 从不）。\n"
+            "停止的当下**故意不卸**：模型留着下一轮直接复用，省掉 2.5 秒加载。\n"
+            "这台机器只有 8GB 显存，老是「启停启停」就把卡占满了，所以默认 5 分钟。")
+        self.idle_unload_spin.valueChanged.connect(self.on_idle_unload_changed)
+        idle_row.addWidget(self.idle_unload_spin)
+        self.model_idle_unload_checkbox = QCheckBox("自动回收")
+        self.model_idle_unload_checkbox.setChecked(config.get("model_idle_unload_enabled", True))
+        self.model_idle_unload_checkbox.setToolTip("关掉之后只有手动点「释放显存」才放模型")
+        self.model_idle_unload_checkbox.stateChanged.connect(self.on_idle_unload_changed)
+        idle_row.addWidget(self.model_idle_unload_checkbox)
+        idle_row.addStretch(1)
+
+        # 服务地址 / 接口类型 / 单句超时 / 闲置卸载是装好之后就很少动的，收进"高级设置"；
         # "本地模型"和"本地状态"留在翻译设置里（换模型、看通不通是常用动作）。
         # 装了它们的小盒子独立出来：切到 Google 时也要一起藏起来。
         self.local_advanced_box = QWidget()
@@ -451,6 +492,7 @@ class MainWindow(QMainWindow):
         local_advanced_layout.addLayout(url_row)
         local_advanced_layout.addLayout(api_row)
         local_advanced_layout.addLayout(timeout_row)
+        local_advanced_layout.addLayout(idle_row)
         advanced_layout.addWidget(self.local_advanced_box)
 
         status_row = QHBoxLayout()
@@ -472,6 +514,23 @@ class MainWindow(QMainWindow):
         local_active = self.translation_backend_combo.currentText().startswith("本地")
         self.local_llm_box.setVisible(local_active)
         self.local_advanced_box.setVisible(local_active)
+
+        # 「显存」这一行**故意放在 local_llm_box 外面**（切到 Google 时不会被一起藏起来）：
+        # 它报的是整台机器的驻留情况——识别模型、本地大模型各占多少，而"显存被占满"
+        # 这件事跟翻译后端是不是 Google 没关系（流式识别引擎才是大头的那个占位者）。
+        residency_row = QHBoxLayout()
+        residency_row.addWidget(self._fixed_label("显存:"))
+        self.residency_label = QLabel("")
+        self.residency_label.setWordWrap(True)
+        self.residency_label.setStyleSheet("color: #555555;")
+        residency_row.addWidget(self.residency_label, 1)
+        self.release_gpu_button = QPushButton("释放显存")
+        self.release_gpu_button.setToolTip(
+            "立刻把识别模型和本地大模型从显存里放掉（后台执行，不卡界面）。\n"
+            "下一次「开始翻译」会重新加载（流式 small 约 2.5 秒，本地大模型另算）。")
+        self.release_gpu_button.clicked.connect(self.on_release_gpu)
+        residency_row.addWidget(self.release_gpu_button)
+        translation_layout.addLayout(residency_row)
 
         # 后台探活的定时器与结果槽：控件只能在界面线程碰，所以工作线程只写结果、
         # 由这个 150ms 的定时器取回来（和主窗口轮询翻译结果的思路一致）
@@ -881,10 +940,13 @@ class MainWindow(QMainWindow):
         try:
             # 保存所有设置
             self.save_all_settings()
-            
+
             # 停止定时器
             if hasattr(self, 'timer') and self.timer:
                 self.timer.stop()
+            if hasattr(self, '_residency_timer') and self._residency_timer:
+                # 先停掉闲置回收的定时器：下面要手动放，别让它在半路上再插一手
+                self._residency_timer.stop()
 
             # 停止后台翻译线程
             if hasattr(self, 'translation_worker') and self.translation_worker:
@@ -913,16 +975,34 @@ class MainWindow(QMainWindow):
                         print("停止Whisper线程池...")
                         self.audio_manager.audio_processor.thread_pool.stop()
             
+            # 关掉本地翻译客户端（连接池）
+            if hasattr(self, 'subtitle_manager') and self.subtitle_manager:
+                try:
+                    self.subtitle_manager.close_local()
+                except Exception as e:
+                    print("关闭本地翻译客户端失败（忽略）：%s" % e)
+
             # 关闭字幕窗口
             if hasattr(self, 'subtitle_window') and self.subtitle_window:
                 print("关闭字幕窗口...")
                 self.subtitle_window.close()
-            
+
+            # 放掉所有还占着显存的模型：识别引擎、整句模型、Ollama 里的本地大模型。
+            # force=True —— 此时 is_running 可能还是 True，ASR 那条 guard 会把它拦下来，
+            # 而我们已经走到"进程要退出"这一步了，拦着没有意义。
+            # **必须排在下面那次 empty_cache 之前**：torch 只回收"已经没人引用"的块，
+            # 顺序反了就有一大块拿不回来。
+            try:
+                released, skipped = model_residency.release_all(force=True)
+                print("显存回收：放掉 %d 项，跳过 %d 项" % (released, skipped))
+            except Exception as e:
+                print("显存回收失败（忽略）：%s" % e)
+
             # 强制清理资源
             import gc
             print("执行垃圾回收...")
             gc.collect()
-            
+
             # 如果使用GPU，清理CUDA缓存
             try:
                 import torch
@@ -931,7 +1011,7 @@ class MainWindow(QMainWindow):
                     torch.cuda.empty_cache()
             except:
                 pass
-                
+
             print("关闭窗口完成")
             
             # 接受关闭事件
@@ -1382,6 +1462,19 @@ class MainWindow(QMainWindow):
             self._prefix_source_text = ""
             self._finalized_utterance = None
             self.update_stream_status()
+
+            # 翻译线程停掉、队列抽干。
+            # 以前这两件事只在关窗口时做：停止之后那条线程还活着，继续把队列里剩下的
+            # 请求翻完 —— 每翻一条就向服务发一次请求、顺手把模型 keep_alive 又续上半小时，
+            # 于是"停止翻译"在显存上等于什么都没发生。抽干的队列下次 request() 会重新
+            # 建线程，不影响再开一轮。
+            self.translation_worker.stop()
+
+            # 记下"翻译模型从这一刻起闲置"：停止时**故意不卸模型**（下一轮直接复用，
+            # 省掉冷加载那一两秒），真正的回收交给闲置超时/「释放显存」/关窗口。
+            model_residency.touch("llm")
+            self._start_resident_query()
+            self._refresh_residency_label()
 
             # 恢复输入音量监听
             self._refresh_input_monitor()
@@ -2097,25 +2190,61 @@ class MainWindow(QMainWindow):
         if backend == "local":
             # 切回本地时顺手问一次服务（模型可能是刚拉下来的）
             self.refresh_local_models()
+        else:
+            # 不用本地模型了：立刻把显存还回去（后台跑，别卡界面）。
+            # 不点「停止翻译」只是不用它，模型会一直挂到 keep_alive 到期。
+            self._release_local_model_async()
 
     def on_local_model_changed(self, model):
         """换了本地模型：缓存键里带着模型名，所以旧译文不会被误用"""
         model = (model or "").strip()
         if model:
             config.set("local_llm_model", model)
+            # 后台清场：把除新模型之外的都卸掉。8GB 卡上多模型同驻会让 Ollama 为了
+            # 腾地方把正在用的那个挤掉重载，界面上就是"某些句子突然回落成原文"。
+            if config.get("unload_previous_llm_on_switch", True):
+                self._unload_other_models_async(model)
 
     def on_local_url_changed(self):
         url = self.local_url_edit.text().strip()
         if url != config.get("local_llm_url", ""):
             config.set("local_llm_url", url)
+            # 换了服务：旧服务的"热模型"记忆作废，否则下一次请求按 3 秒超时发、必然回落
+            self.subtitle_manager.local_forget_warm()
             self.refresh_local_models()
 
     def on_local_api_changed(self, text):
         config.set("local_llm_api", "openai" if text.startswith("OpenAI") else "ollama")
+        self.subtitle_manager.local_forget_warm()
         self.refresh_local_models()
 
     def on_local_timeout_changed(self, value):
         config.set("local_llm_timeout_ms", int(value))
+
+    def on_idle_unload_changed(self, _value=None):
+        """闲置卸载的两个开关（秒数 / 是否自动）：立刻生效并落盘"""
+        config.set("model_idle_unload_sec", int(self.idle_unload_spin.value()))
+        config.set("model_idle_unload_enabled",
+                   bool(self.model_idle_unload_checkbox.isChecked()))
+        self._apply_residency_settings()
+
+    def _unload_other_models_async(self, keep=None):
+        """后台把 `keep` 之外的驻留模型卸掉（HTTP 请求不能放界面线程）"""
+        def worker():
+            try:
+                self.subtitle_manager.local_unload_others(keep)
+            except Exception as e:
+                print("清理多余模型失败（忽略）：%s" % e)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _release_local_model_async(self):
+        """后台放掉本地翻译模型（走显存账本，成功失败都只记日志）"""
+        def worker():
+            try:
+                model_residency.release("llm")
+            except Exception as e:
+                print("释放本地模型失败（忽略）：%s" % e)
+        threading.Thread(target=worker, daemon=True).start()
 
     def refresh_local_models(self):
         """后台问一次本地服务有哪些模型，回来再填下拉框（不阻塞界面）"""
@@ -2193,6 +2322,108 @@ class MainWindow(QMainWindow):
         self.local_model_combo.blockSignals(False)
         if pick != configured:
             config.set("local_llm_model", pick)
+
+    # ---------------------------------------------------------------- 显存回收
+
+    def _apply_residency_settings(self):
+        """把闲置卸载的设置灌进显存账本（启动时、改设置时各来一次）
+
+        `model_idle_unload_enabled` 关掉 = 超时设 0 = 只认手动点「释放显存」。
+        """
+        enabled = bool(config.get("model_idle_unload_enabled", True))
+        seconds = int(config.get("model_idle_unload_sec", 300) or 0)
+        if not enabled:
+            seconds = 0
+        for key in ("asr_simul", "asr_batch", "llm"):
+            model_residency.set_idle_timeout(key, seconds)
+
+    def _on_residency_tick(self):
+        """每 2 秒：到点的模型放掉，顺手把那行状态刷一下
+
+        这里**不做任何会阻塞的事**：`sweep()` 只在真有闲置超时的项时才动（放掉本身是
+        本地释放或一条 fire-and-forget 的 HTTP 卸载请求），查 Ollama 那边驻留了谁要发
+        请求，所以挪到后台线程、结果由这个定时器取回来（`_poll_residency` 那套）。
+        """
+        model_residency.sweep()
+        self._poll_release_result()
+        self._poll_resident_query()
+        # 查 Ollama 驻留名单要发一次 HTTP，10 秒够用了（2 秒一次纯属浪费）
+        self._resident_tick = (self._resident_tick + 1) % 5
+        if self._resident_tick == 0:
+            self._start_resident_query()
+        self._refresh_residency_label()
+
+    def _refresh_residency_label(self):
+        """「显存 X MiB ｜ 流式识别: 驻留(闲 12s) ｜ 本地翻译: 已卸载」"""
+        memory = cuda_memory_mib()
+        if memory is None:
+            text = "torch 未占用（CPU 模式）"
+        else:
+            text = "torch 已用 %.0f MiB（保留 %.0f）" % memory
+        text += " ｜ " + model_residency.describe()
+        resident = self._resident_models
+        if resident:
+            text += " ｜ Ollama 驻留：" + "、".join(
+                "%s %.0fMiB" % (name, size) for name, size, _expires in resident)
+        self.residency_label.setText(text)
+
+    def _start_resident_query(self):
+        """后台问一次"服务上现在驻留着哪些模型"（不在界面线程发请求）"""
+        if self._resident_query_running:
+            return
+        self._resident_query_running = True
+        threading.Thread(target=self._resident_query_worker, daemon=True).start()
+
+    def _resident_query_worker(self):
+        try:
+            self._resident_query_result = self.subtitle_manager.local_resident_models()
+        except Exception as e:
+            print("查询驻留模型失败（忽略）：%s" % e)
+            self._resident_query_result = []
+
+    def _poll_resident_query(self):
+        result = self._resident_query_result
+        if result is None:
+            return
+        self._resident_query_result = None
+        self._resident_query_running = False
+        self._resident_models = result
+
+    def on_release_gpu(self):
+        """「释放显存」：等于把账本上所有驻留项放掉，再补一次 empty_cache
+
+        放模型本身可能耗时（`empty_cache()`、一条 HTTP 卸载请求），所以整件事丢给后台
+        线程；按钮那一下先给个"正在释放"的反馈，免得用户以为没反应。
+        """
+        if self._residency_releasing:
+            return
+        self._residency_releasing = True
+        self.release_gpu_button.setEnabled(False)
+        self.release_gpu_button.setText("释放中…")
+
+        def worker():
+            released, skipped = model_residency.release_all()
+            free_cuda_cache()
+            self._residency_release_result = (released, skipped)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _poll_release_result(self):
+        """界面线程取「释放显存」的结果（定时器里调）"""
+        result = self._residency_release_result
+        if result is None:
+            return
+        self._residency_release_result = None
+        self._residency_releasing = False
+        self.release_gpu_button.setEnabled(True)
+        self.release_gpu_button.setText("释放显存")
+        released, skipped = result
+        if skipped:
+            # 正在识别时识别模型会被 guard 拦住——这不算错，但得说出来
+            print("释放显存：放下 %d 项，%d 项没放下（正在使用或出错，见账本 last_release_error）"
+                  % (released, skipped))
+        self._start_resident_query()
+        self._refresh_residency_label()
 
     def open_model_folder(self):
         # whisper模型默认缓存目录
